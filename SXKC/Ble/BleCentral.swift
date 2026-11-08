@@ -51,6 +51,9 @@ final class BleCentral: NSObject {
     private static let restoreId = "cn.sxkc.ios.central"
 
     private static let CONNECT_TIMEOUT_MS: Int = 10000
+    /// 两次发起连接之间的最小间隔。太密没用：刚断的链路在车机侧还没释放，
+    /// 连上去只会再超时一次，日志里就是「12s 后重连」却 3 秒就重连、随后又超时的死循环。
+    private static let RETRY_GAP_MS: Int64 = 4000
 
     // MARK: 状态
 
@@ -80,12 +83,24 @@ final class BleCentral: NSObject {
     private var lastAttemptAt: Int64 = 0
     private var lastSeen: Int64 = 0
     private var lastLoggedMissing = ""
-    private var lastArmedLog: Bool? = nil
 
     /// 每次动作递增，用于让旧定时器失效
     private var gen = 0
 
     private var scanning = false
+    /// 这一轮扫的是不是「按服务过滤」。重复调用同一种扫描直接忽略，
+    /// 否则每调一次就 stopScan + 重扫，把兜底定时器叠成两份（实测同一秒两条「扫描车机」）。
+    private var scanningFiltered = false
+    /// 扫描代号：每起一轮 +1，上一轮挂着的 6 秒 / 20 秒兜底定时器看它自动失效
+    private var scanGen = 0
+    /// 正在发起连接。iOS 的 connect() 没有同步返回值，只能自己记一笔，
+    /// 否则连点「手动连接」会叠出 4 次 connect + 4 次握手，最后特征引用全乱。
+    private var connecting = false
+    /// 保活心跳：车机侧 10 秒内没有往来就断链路（实测 12 秒），
+    /// 只靠被动收状态帧不够稳，主动 readRSSI 既保活又顺手更新距离。
+    private var pingTimer: Timer?
+    private var lastStatusFlags = ""
+
     private var sawAnyDevice = false
     private(set) var diagMode = false
 
@@ -117,6 +132,31 @@ final class BleCentral: NSObject {
 
     func setKeepAlive(_ on: Bool) {
         keepAlive = on
+        if on { startPing() } else { stopPing() }
+    }
+
+    // MARK: 保活
+
+    /// 心跳。车机侧一旦 10 秒左右收不到任何往来就把链路掐掉
+    /// （日志里两次典型现场：连上 12 秒后 `The connection has timed out unexpectedly`），
+    /// 而它自己的状态帧是「有变化才推」，空闲十几秒很正常 —— 光靠被动收包必断。
+    ///
+    /// 用 readRSSI 而不是发业务帧：不改车机状态、不需要密钥、还能顺手刷新距离。
+    private func startPing() {
+        guard keepAlive, ready else { return }
+        stopPing()
+        let t = Timer(timeInterval: 5.0, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            guard self.connected, let p = self.peripheral, p.state == .connected else { return }
+            p.readRSSI()
+        }
+        RunLoop.main.add(t, forMode: .common)
+        pingTimer = t
+    }
+
+    private func stopPing() {
+        pingTimer?.invalidate()
+        pingTimer = nil
     }
 
     var hasSavedTarget: Bool {
@@ -146,36 +186,47 @@ final class BleCentral: NSObject {
             logOnce("no-bt", "蓝牙未开启或未授权蓝牙权限")
             return
         }
+        if connecting { return }
         if let p = peripheral {
             if p.state == .connected { return }
             if p.state == .connecting { return }
-            let now = CarAPI.nowMs()
-            if now - lastAttemptAt < 4000 { return }
-            lastAttemptAt = now
-            p.delegate = self
+            if CarAPI.nowMs() - lastAttemptAt < BleCentral.RETRY_GAP_MS { return }
             connectHint = p.name ?? p.identifier.uuidString
             log("重连车机 \(connectHint)")
-            central.connect(p, options: nil)
-            scheduleConnectTimeout()
+            beginConnect(p)
             return
         }
         if let u = savedUuid,
            let p = central.retrievePeripherals(withIdentifiers: [u]).first {
+            // 这一支原来没有节流：只要 peripheral 被清成 nil（比如连接超时后会清），
+            // 任何一个 ensureConnected 调用者都能在断开 3 秒后立刻重连，退避形同虚设，
+            // 而刚断的链路往往还没恢复，重连必然再超时一次。这里跟上面用同一个间隔。
+            if CarAPI.nowMs() - lastAttemptAt < BleCentral.RETRY_GAP_MS { return }
             peripheral = p
             p.delegate = self
-            lastAttemptAt = CarAPI.nowMs()
+            connectHint = p.name ?? u.uuidString
             log("连接已记住的车机 \(p.name ?? u.uuidString)")
-            central.connect(p, options: nil)
-            scheduleConnectTimeout()
+            beginConnect(p)
             return
         }
         // 没有任何记录 → 只能扫一遍把车机找出来
         startScan(filtered: true)
     }
 
+    /// 统一入口：记一笔「正在连」+ 起连接超时定时器
+    private func beginConnect(_ p: CBPeripheral) {
+        connecting = true
+        lastAttemptAt = CarAPI.nowMs()
+        central.connect(p, options: nil)
+        scheduleConnectTimeout()
+    }
+
     func disconnect() {
         gen += 1          // 让所有挂起的超时回调失效
         scanning = false
+        scanGen += 1
+        connecting = false
+        stopPing()
         central.stopScan()
         if let p = peripheral {
             central.cancelPeripheralConnection(p)
@@ -198,6 +249,9 @@ final class BleCentral: NSObject {
         gen += 1
         keepAlive = false
         scanning = false
+        scanGen += 1
+        connecting = false
+        stopPing()
         diagMode = false
         central?.stopScan()
         if let p = peripheral {
@@ -221,7 +275,7 @@ final class BleCentral: NSObject {
         lastSeen = 0
         lastRssiAt = 0
         lastAttemptAt = 0
-        lastArmedLog = nil
+        lastStatusFlags = ""
         lastLoggedMissing = ""
         log("已清空蓝牙会话（车机记录保留）")
     }
@@ -244,8 +298,16 @@ final class BleCentral: NSObject {
 
     func startScan(filtered: Bool) {
         guard central.state == .poweredOn else { return }
-        if scanning { central.stopScan() }
+        // 同一种扫描已经在跑就直接忽略。原来每调一次都 stopScan + 重扫，
+        // 6 秒和 20 秒两个兜底定时器会叠成两份 —— 日志里同一秒两条「扫描车机」、
+        // 六秒后两条「退化为全量扫描」就是这么来的。
+        if scanning && scanningFiltered == filtered { return }
+        if scanning { central.stopScan() }   // 过滤 → 全量 是正当降级，允许切换
+
+        scanGen += 1
+        let g = scanGen
         scanning = true
+        scanningFiltered = filtered
         sawAnyDevice = false
         let services: [CBUUID]? = filtered ? [BleCentral.svcCar] : nil
         log(filtered ? "扫描车机（按 0xFFE0 服务过滤）…" : "全量扫描（不过滤）…")
@@ -255,13 +317,15 @@ final class BleCentral: NSObject {
         // 过滤扫不到就退化为全量扫；全量也找不到就提示去诊断页
         if filtered {
             DispatchQueue.main.asyncAfter(deadline: .now() + 6.0) { [weak self] in
-                guard let self = self, self.scanning, self.peripheral == nil, !self.sawAnyDevice else { return }
+                guard let self = self, self.scanGen == g, self.scanning,
+                      self.peripheral == nil, !self.sawAnyDevice else { return }
                 self.log("广播里没有 0xFFE0，退化为全量扫描")
                 self.startScan(filtered: false)
             }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 20.0) { [weak self] in
-            guard let self = self, !self.diagMode, self.scanning, self.peripheral == nil else { return }
+            guard let self = self, self.scanGen == g, !self.diagMode,
+                  self.scanning, self.peripheral == nil else { return }
             self.scanning = false
             self.central.stopScan()
             self.log("扫不到车机。请到「蓝牙诊断」页全量扫描，手动连接一次，之后会自动记住")
@@ -273,8 +337,15 @@ final class BleCentral: NSObject {
         startScan(filtered: false)
     }
 
+    /// 从诊断页配对完之后 diagMode 会一直留着，而 diagMode 开着时
+    /// 自动扫描不会超时、不会提示「扫不到车机」。自动模式启动时清掉它。
+    func clearDiagMode() {
+        diagMode = false
+    }
+
     func stopDiagScan() {
         scanning = false
+        scanGen += 1
         central.stopScan()
         diagMode = false
         log("停止扫描")
@@ -282,8 +353,20 @@ final class BleCentral: NSObject {
 
     /// 诊断页手动指定设备
     func connectManually(_ p: CBPeripheral) {
+        // 同一个设备已经在连 / 已连上：直接回一行日志，别再发一次 connect。
+        // 连点四下就是四次握手、四个会话，特征引用最后会指向一个已经废弃的 session，
+        // 之后所有写入都报「没有连接或没有可写特征」。
+        if p.state == .connecting || connecting {
+            log("正在连接 \(p.name ?? "这台设备")，不用重复点")
+            return
+        }
+        if p.state == .connected && peripheral?.identifier == p.identifier {
+            log("已经连着 \(p.name ?? "这台设备")")
+            return
+        }
         diagMode = true
         scanning = false
+        scanGen += 1
         central.stopScan()
         if let old = peripheral, old.identifier != p.identifier {
             central.cancelPeripheralConnection(old)
@@ -292,11 +375,9 @@ final class BleCentral: NSObject {
         p.delegate = self
         ready = false
         connected = false
-        lastAttemptAt = CarAPI.nowMs()
         connectHint = p.name ?? p.identifier.uuidString
         log("手动连接 \(p.name ?? "未命名") / \(p.identifier.uuidString)")
-        central.connect(p, options: nil)
-        scheduleConnectTimeout()
+        beginConnect(p)
     }
 
     // MARK: - 动作
@@ -322,6 +403,18 @@ final class BleCentral: NSObject {
             sendAction()
             return
         }
+        if connected && chr != nil && btkey != nil {
+            // 链路还在，只是握手没成（上一次握手应答丢了 / 刚被车机踢过）：
+            // 补一次握手比重新连接快得多，也不用再走 13 秒的连接超时。
+            log("链路还在但没有会话密钥，重新握手")
+            handshake()
+            let g0 = gen
+            DispatchQueue.main.asyncAfter(deadline: .now() + 6.0) { [weak self] in
+                guard let self = self, self.gen == g0 else { return }
+                if self.busy && !self.done && !self.ready { self.fail("握手无应答") }
+            }
+            return
+        }
         ensureConnected()
         let g = gen
         DispatchQueue.main.asyncAfter(deadline: .now() + 13.0) { [weak self] in
@@ -344,7 +437,13 @@ final class BleCentral: NSObject {
     /// 诊断页用：直接发一段 HEX（不加密、不加帧头）
     func sendRawHex(_ s: String) {
         let bytes = Hex.to(s)
-        guard !bytes.isEmpty, let p = peripheral, let c = chr else {
+        // 两种情况分开报：原来一句「没有连接或没有可写特征」把「输入框是空的」也算进去了，
+        // 日志里连续四条一样的报错会让人以为是蓝牙掉了。
+        if bytes.isEmpty {
+            log("✗ 输入框里没有有效 HEX")
+            return
+        }
+        guard let p = peripheral, let c = chr else {
             log("✗ 没有连接或没有可写特征")
             return
         }
@@ -452,6 +551,7 @@ final class BleCentral: NSObject {
                 ready = true
                 log("握手成功")
                 link("蓝牙就绪")
+                startPing()
                 if busy && !done { sendAction() }
             } else {
                 log("握手被拒 code=\(st)")
@@ -459,20 +559,24 @@ final class BleCentral: NSObject {
             }
         } else if type == Frame.TYPE_STATUS {
             let armed = Frame.armedOfStatusBody(b)
-            // 状态帧 3 秒一帧，只在翻转时记日志，否则日志会被刷爆
-            if lastArmedLog != armed {
-                lastArmedLog = armed
-                log("状态帧 flags=\(Frame.statusFlags(b)) \(armed ? "已锁" : "未锁")")
+            // 状态帧只在 flags 字节变化时记一行，且把整帧明文带上 ——
+            // 之前只记 armed 的布尔值，01/11/21 之间的来回跳完全看不出来。
+            let fl = Frame.statusFlags(b)
+            if lastStatusFlags != fl {
+                lastStatusFlags = fl
+                log("状态帧 flags=\(fl) \(armed ? "已锁" : "未锁") body=\(Hex.of(b))")
             }
             delegate?.bleArmed(self, armed)
             if busy && !done && armed == !wantUnlock {
                 succeed(wantUnlock ? "已解锁" : "已锁车")
             }
         } else if type == Frame.TYPE_CTRL {
-            if st == 0x00 {
-                succeed("车机已执行")
+            // 没有正在执行的指令时（比如诊断页直接发的帧）只记一行，
+            // 不能走 succeed()：它会把 done 置 true，下一条真指令的回执就吞了。
+            if busy && !done {
+                if st == 0x00 { succeed("车机已执行") } else { fail("车机返回 \(st)") }
             } else {
-                fail("车机返回 \(st)")
+                log(st == 0x00 ? "← 车机执行回执" : "← 车机返回 \(st)")
             }
         }
     }
@@ -545,6 +649,14 @@ extension BleCentral: CBCentralManagerDelegate {
             p.delegate = self
             connected = (p.state == .connected)
             log("后台恢复：拿回车机连接")
+            if connected {
+                // 进程被杀过再恢复时，特征引用和会话密钥都没了，光"连着"发不出指令。
+                // 重新走一遍服务发现 → 订阅 → 握手，链路在就不会再花连接时间。
+                ready = false
+                chr = nil
+                busKey = nil
+                p.discoverServices(nil)
+            }
         }
     }
 
@@ -556,41 +668,52 @@ extension BleCentral: CBCentralManagerDelegate {
         let adv = advertisementData
         delegate?.bleDiscovered(self, peripheral, rssi: RSSI.intValue, adv: adv)
 
-        let advServices = (adv[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID]) ?? []
-        let hasCarSvc = advServices.contains(BleCentral.svcCar)
-        let saved = savedUuid
-
         if diagMode {
             // 诊断页只看不连，用户手动点
             return
         }
+        // allowDuplicates 下一台设备每秒能报好几次，这里必须挡住，
+        // 否则每次回调都 connect 一次，叠出多个会话。
+        if connecting || peripheral.state == .connecting || peripheral.state == .connected {
+            return
+        }
+
+        let advServices = (adv[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID]) ?? []
+        let hasCarSvc = advServices.contains(BleCentral.svcCar)
+        // 车机广播里不一定带 0xFFE0（实测同一台机器时有时无），
+        // 但它的设备名就是 tid —— 日志里扫到的正是 `30071067124`。
+        // 名字当第二指纹，首配就不用赌广播包内容了。
+        let advName = (adv[CBAdvertisementDataLocalNameKey] as? String) ?? peripheral.name ?? ""
+        let nameHit = !tid.isEmpty && advName == tid
+        let saved = savedUuid
 
         if let s = saved {
             if peripheral.identifier == s {
                 scanning = false
+                scanGen += 1
                 central.stopScan()
                 self.peripheral = peripheral
                 peripheral.delegate = self
                 log("扫到已记住的车机，连接…")
-                central.connect(peripheral, options: nil)
-                scheduleConnectTimeout()
+                beginConnect(peripheral)
             }
             return
         }
 
-        // 第一次用：认 0xFFE0 广播做指纹
-        if hasCarSvc && peripheral.state == .disconnected {
+        // 第一次用：认 0xFFE0 广播，或认设备名
+        if hasCarSvc || nameHit {
             scanning = false
+            scanGen += 1
             central.stopScan()
             self.peripheral = peripheral
             peripheral.delegate = self
-            log("发现带 0xFFE0 的设备 \(peripheral.name ?? "未命名")，连接校验…")
-            central.connect(peripheral, options: nil)
-            scheduleConnectTimeout()
+            log("发现\(hasCarSvc ? "带 0xFFE0" : "名字匹配")的设备 \(advName)，连接校验…")
+            beginConnect(peripheral)
         }
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        connecting = false
         self.peripheral = peripheral
         connected = true
         ready = false
@@ -604,6 +727,7 @@ extension BleCentral: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager,
                         didFailToConnect peripheral: CBPeripheral,
                         error: Error?) {
+        connecting = false
         connected = false
         log("连接失败 \(error?.localizedDescription ?? "")")
         if busy && !done { fail("连接失败") }
@@ -613,10 +737,12 @@ extension BleCentral: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager,
                         didDisconnectPeripheral peripheral: CBPeripheral,
                         error: Error?) {
+        connecting = false
         connected = false
         ready = false
         rssi = -127
         busKey = nil
+        stopPing()
         delegate?.bleConnected(self, false)
         if busy && !done {
             fail("连接断开")
@@ -714,8 +840,15 @@ extension BleCentral: CBPeripheralDelegate {
         if characteristic.uuid == BleCentral.chrBattery {
             let b = [UInt8](d)
             if let first = b.first {
-                battery = Int(first)
-                log("车机电池 \(battery)%")
+                // 这台车机从来不报电量：4 次连接、每次读回来都是 0x00。
+                // 别把 0 当 0% 显示（会让人以为车要没电了），直接当无效值。
+                if first > 0 && first <= 100 {
+                    battery = Int(first)
+                    log("车机电池 \(battery)%")
+                } else {
+                    battery = -1
+                    logOnce("battery-invalid", "车机不报电量（读到 0x\(String(format: "%02X", first))），显示 —")
+                }
             }
             return
         }
