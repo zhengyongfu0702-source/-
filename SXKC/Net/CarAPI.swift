@@ -84,7 +84,10 @@ final class CarAPI {
     var lastReport: Car?
 
     private var seq = 1
-    private let lock = NSLock()
+    /// 保护 seq 的互斥锁。
+    /// 注意：**不能叫 `lock`** —— 下面有 `func lock()`（锁车指令），
+    /// Swift 不允许同一个类型里属性和方法同名（invalid redeclaration）。
+    private let mutex = NSLock()
 
     var hasSession: Bool {
         return !ssk.isEmpty && !tid.isEmpty
@@ -105,10 +108,10 @@ final class CarAPI {
     }
 
     private func ssn() -> String {
-        lock.lock()
+        mutex.lock()
         seq = (seq + 1) % 10000
         let s = seq
-        lock.unlock()
+        mutex.unlock()
         return uid + CarAPI.fmt("HHmmss") + String(format: "%04d", s)
     }
 
