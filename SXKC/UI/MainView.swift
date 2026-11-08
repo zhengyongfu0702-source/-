@@ -5,9 +5,27 @@ struct MainView: View {
 
     @State private var thr: Double = Double(Store.shared.thr)
     @State private var bleThr: Double = Double(Store.shared.bleLockThr)
-    @State private var showDiag = false
+    @State private var geoNear: Double = Store.shared.geoNearM
     @State private var showSettings = false
     @State private var showLogout = false
+    @State private var showEngine = false
+    @State private var engineStart = true
+    /// 同一个视图上挂两个 .sheet，在 iOS 14 上只有第一个会生效。
+    /// 所以这里用一个可选的枚举统一驱动，而不是两个 isPresented。
+    @State private var sheet: SheetKind?
+
+    private enum SheetKind: Int, Identifiable {
+        case diag, cards
+        var id: Int { return rawValue }
+    }
+
+    /// 版本号从 Bundle 读，装完一眼能确认是哪一版，不用去系统设置里翻
+    static var versionText: String {
+        let info = Bundle.main.infoDictionary
+        let v = (info?["CFBundleShortVersionString"] as? String) ?? "?"
+        let b = (info?["CFBundleVersion"] as? String) ?? "?"
+        return "顺心控车 Lite  v\(v) (\(b))"
+    }
 
     private var armedText: String {
         if !e.armedKnown { return "状态未知" }
@@ -23,12 +41,21 @@ struct MainView: View {
         NavigationView {
             ScrollView {
                 VStack(spacing: 14) {
-                    statusCard
-                    actionCard
-                    autoCard
-                    sliderCard
-                    consoleCard
-                    accountCard
+                    // 顺序和显隐来自 Cards（本地存储），不再是写死的九块。
+                    // 关掉排序页回来时 showCards 变化会触发重算，这里就会重排。
+                    ForEach(Cards.visible, id: \.self) { id in
+                        cardView(id)
+                    }
+
+                    Button {
+                        sheet = .cards
+                    } label: {
+                        Text("卡片顺序 · 显示与隐藏")
+                            .font(.system(size: 12))
+                            .foregroundColor(UI.dim)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 10)
+                    }
                 }
                 .padding(16)
                 .padding(.bottom, 24)
@@ -37,16 +64,40 @@ struct MainView: View {
             .navigationTitle("顺心控车")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("卡片") { sheet = .cards }
+                        .foregroundColor(UI.accent)
+                }
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    Button("诊断") { showDiag = true }
+                    Button("诊断") { sheet = .diag }
                         .foregroundColor(UI.accent)
                 }
             }
-            .sheet(isPresented: $showDiag) {
-                DiagView().environmentObject(e)
+            .sheet(item: $sheet) { kind in
+                if kind == .diag {
+                    DiagView().environmentObject(e)
+                } else {
+                    CardOrderView()
+                }
             }
         }
         .navigationViewStyle(.stack)
+    }
+
+    /// 卡片 id → 视图。新增卡片只改这里和 Cards 的枚举，主界面不用动。
+    @ViewBuilder
+    private func cardView(_ id: CardID) -> some View {
+        switch id {
+        case .status:  statusCard
+        case .actions: actionCard
+        case .loc:     locCard
+        case .auto:    autoCard
+        case .wash:    washCard
+        case .stats:   statsCard
+        case .slider:  sliderCard
+        case .console: consoleCard
+        case .account: accountCard
+        }
     }
 
     // MARK: 状态
@@ -80,7 +131,21 @@ struct MainView: View {
                     statItem("信号",
                              e.rssi > -120 ? "\(e.rssi) dBm" : "--",
                              e.rssi >= Int(thr) ? UI.ok : UI.dim)
-                    statItem("距离档", distanceText, UI.dim)
+                    statItem("判据",
+                             e.geoActive ? "定位" : "蓝牙",
+                             e.geoActive ? UI.ok : UI.dim)
+                }
+
+                if !e.distText.isEmpty {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Text(e.distText)
+                            .font(.system(size: 15, weight: .medium))
+                            .foregroundColor(e.geoActive ? UI.ok : UI.dim)
+                        Spacer()
+                        Text(e.locText)
+                            .font(.system(size: 11))
+                            .foregroundColor(UI.dim)
+                    }
                 }
 
                 if !e.lastResult.isEmpty {
@@ -88,18 +153,14 @@ struct MainView: View {
                         .font(.system(size: 12))
                         .foregroundColor(UI.dim)
                 }
+
+                // 门位还没逆出来。这里如实写「未知」，而不是留空让人以为门是关的：
+                // 「门没关严就落锁」是所有方案都强调的问题，宁可显示未知也不能假装正常。
+                Text(e.doorText)
+                    .font(.system(size: 10))
+                    .foregroundColor(UI.dim.opacity(0.85))
             }
         }
-    }
-
-    private var distanceText: String {
-        let r = e.rssi
-        if r > -55 { return "很近 <1m" }
-        if r > -65 { return "近 1~3m" }
-        if r > -75 { return "中 3~8m" }
-        if r > -85 { return "远 8~15m" }
-        if r > -120 { return "很远 >15m" }
-        return "--"
     }
 
     private func statItem(_ t: String, _ v: String, _ c: Color) -> some View {
@@ -114,10 +175,10 @@ struct MainView: View {
     private var actionCard: some View {
         VStack(spacing: 10) {
             HStack(spacing: 10) {
-                BigButton(title: "开锁", subtitle: "蓝牙优先", color: UI.accent) {
+                BigButton(title: "开锁", subtitle: "双通道竞速", color: UI.accent) {
                     e.manual(unlock: true)
                 }
-                BigButton(title: "锁车", subtitle: "蓝牙优先", color: UI.warn) {
+                BigButton(title: "锁车", subtitle: "双通道竞速", color: UI.warn) {
                     e.manual(unlock: false)
                 }
             }
@@ -129,10 +190,91 @@ struct MainView: View {
                     e.netOnly(unlock: false)
                 }
             }
-            Text("蓝牙连不上时会自动转网络；右边的两个按钮只走网络，用于手动兜底。")
+            HStack(spacing: 10) {
+                GhostButton(title: "一键启动", color: UI.ok) {
+                    engineStart = true
+                    showEngine = true
+                }
+                GhostButton(title: "熄火", color: UI.dim) {
+                    engineStart = false
+                    showEngine = true
+                }
+            }
+            Text("定位可用时走网络，失败自动转蓝牙；定位不可用时仍是蓝牙优先。"
+                + "最后的两个按钮走网络，人在车外也能用。")
                 .font(.system(size: 11))
                 .foregroundColor(UI.dim)
                 .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .alert(isPresented: $showEngine) {
+            Alert(
+                title: Text(engineStart ? "远程启动发动机？" : "远程熄火？"),
+                message: Text(engineStart
+                              ? "请确认车停在安全位置、档位在 P 挡、周围没有人。启动后车辆会保持怠速。"
+                              : "行驶中熄火会失去助力，请确认车已停稳。"),
+                primaryButton: .destructive(Text(engineStart ? "启动" : "熄火")) {
+                    if engineStart { e.startEngine() } else { e.stopEngine() }
+                },
+                secondaryButton: .cancel(Text("取消"))
+            )
+        }
+    }
+
+    // MARK: 定位
+
+    /// 定位设置。放两个开关：总开关（决定「按距离判」还是「按信号判」）、
+    /// 后台开关（决定锁屏后还算不算距离）。
+    private var locCard: some View {
+        Card {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("定位判距")
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundColor(UI.text)
+                        Text("按车辆定位算真实距离：\(Int(Store.shared.geoNearM)) 米内开锁，超过 \(Int(Store.shared.geoFarM)) 米锁车")
+                            .font(.system(size: 11))
+                            .foregroundColor(UI.dim)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer()
+                    Toggle("", isOn: Binding(
+                        get: { e.geoEnabled },
+                        set: { e.setGeoEnabled($0) }
+                    ))
+                    .labelsHidden()
+                    .toggleStyle(SwitchToggleStyle(tint: UI.accent))
+                }
+
+                Divider().background(UI.line)
+
+                HStack {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("后台持续定位")
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundColor(UI.text)
+                        Text("锁屏后也能判距并自动开关锁。耗电明显增加，系统状态栏会出现定位箭头。")
+                            .font(.system(size: 11))
+                            .foregroundColor(UI.dim)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer()
+                    Toggle("", isOn: Binding(
+                        get: { e.locBackground },
+                        set: { e.setLocBackground($0) }
+                    ))
+                    .labelsHidden()
+                    .toggleStyle(SwitchToggleStyle(tint: UI.accent))
+                }
+
+                Text(e.distText.isEmpty ? "还没有定位数据" : e.distText)
+                    .font(.system(size: 12, design: .monospaced))
+                    .foregroundColor(e.geoActive ? UI.ok : UI.dim)
+
+                Text(e.locText)
+                    .font(.system(size: 11))
+                    .foregroundColor(UI.dim)
+            }
         }
     }
 
@@ -146,9 +288,10 @@ struct MainView: View {
                         Text("自动靠近开锁 / 离开落锁")
                             .font(.system(size: 15, weight: .semibold))
                             .foregroundColor(UI.text)
-                        Text("事件驱动：连上车机判开锁，蓝牙断开即锁车")
+                        Text("定位可用时按真实距离判；不可用时连上车机判开锁、断开即锁")
                             .font(.system(size: 11))
                             .foregroundColor(UI.dim)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                     Spacer()
                     Toggle("", isOn: Binding(
@@ -174,6 +317,92 @@ struct MainView: View {
                         .font(.system(size: 11))
                         .foregroundColor(UI.dim)
                 }
+
+                Divider().background(UI.line)
+
+                toggleRow("双通道竞速",
+                          "开锁 / 锁车时蓝牙与网络同时下发，谁先回执算谁。两条都是幂等指令，不会多锁一次。",
+                          isOn: Binding(get: { e.raceEnabled }, set: { e.setRace($0) }))
+
+                toggleRow("离车较远时降低定位精度",
+                          "300 米外降到粗略定位，回到车附近自动升到 GPS 高频。精度只在需要时花钱。",
+                          isOn: Binding(get: { e.fenceEnabled }, set: { e.setFence($0) }))
+
+                toggleRow("通知与震动",
+                          "自动锁车发一条带距离的通知，开锁轻震一下；连续 3 次锁不上会发强提醒。",
+                          isOn: Binding(get: { e.notifyEnabled }, set: { e.setNotify($0) }))
+            }
+        }
+    }
+
+    private func toggleRow(_ title: String, _ hint: String, isOn: Binding<Bool>) -> some View {
+        HStack(alignment: .center) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundColor(UI.text)
+                Text(hint)
+                    .font(.system(size: 10))
+                    .foregroundColor(UI.dim)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer()
+            Toggle("", isOn: isOn)
+                .labelsHidden()
+                .toggleStyle(SwitchToggleStyle(tint: UI.accent))
+        }
+    }
+
+    // MARK: 洗车 / 代客模式
+
+    private var washCard: some View {
+        Card {
+            VStack(alignment: .leading, spacing: 12) {
+                SectionTitle(text: "洗车 / 代客模式")
+
+                Text("洗车、代客泊车时车辆会反复移动，自动判定就会不停开锁关锁。暂停期间只停自动逻辑，手动按钮照常可用；到点自动恢复。")
+                    .font(.system(size: 11))
+                    .foregroundColor(UI.dim)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Text(e.washText.isEmpty ? "当前：未开启" : "当前：\(e.washText)")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(e.washText.isEmpty ? UI.dim : UI.ok)
+
+                HStack(spacing: 10) {
+                    GhostButton(title: "暂停 30 分钟", color: UI.accent) {
+                        e.setWash(minutes: 30)
+                    }
+                    GhostButton(title: "立即恢复", color: UI.dim) {
+                        e.setWash(minutes: 0)
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: 开锁表现（罚站率）
+
+    private var statsCard: some View {
+        Card {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    SectionTitle(text: "开锁表现")
+                    Spacer()
+                    Button("清空") { e.resetStats() }
+                        .font(.system(size: 12))
+                        .foregroundColor(UI.dim)
+                }
+
+                Text(e.statsText.isEmpty ? Stats.summary() : e.statsText)
+                    .font(.system(size: 12, design: .monospaced))
+                    .foregroundColor(UI.text)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Text("罚站率 =（超过 3 秒才开 + 没开成）/ 总次数。行业参考：UWB 约 1%，纯蓝牙约 10%。只统计自动开锁。")
+                    .font(.system(size: 10))
+                    .foregroundColor(UI.dim)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
@@ -185,12 +414,19 @@ struct MainView: View {
             VStack(alignment: .leading, spacing: 20) {
                 SectionTitle(text: "距离与延时")
 
+                SliderRow(title: "靠近门限",
+                          unit: " 米",
+                          value: $geoNear,
+                          range: 5 ... 30,
+                          step: 1,
+                          hint: "定位算出的直线距离小于它就算「在车旁」。离开门限自动取它的 2 倍（\(Int(geoNear * 2)) 米），中间这段是死区，专门吃掉 GPS 抖动。")
+
                 SliderRow(title: "开锁信号门限",
                           unit: " dBm",
                           value: $thr,
                           range: -95 ... -45,
                           step: 1,
-                          hint: "信号强于此值才算「靠近」。后台拿不到信号时，只要连上车机就按「在附近」处理。")
+                          hint: "定位用不了时才看这一项：信号强于此值才算「靠近」。后台拿不到信号时，只要连上车机就按「在附近」处理。")
 
                 VStack(alignment: .leading, spacing: 6) {
                     Text("离开判定：蓝牙一断开就锁车")
@@ -221,6 +457,11 @@ struct MainView: View {
         }
         .onChange(of: thr) { v in Store.shared.thr = Int(v) }
         .onChange(of: bleThr) { v in Store.shared.bleLockThr = Int(v) }
+        .onChange(of: geoNear) { v in
+            Store.shared.geoNearM = v
+            // 离开门限跟着走，保持「至少 2 倍」，否则死区会被挤没
+            Store.shared.geoFarM = max(v * 2, v + 10)
+        }
     }
 
     // MARK: 日志
@@ -300,6 +541,10 @@ struct MainView: View {
                 Text("换账号请先退出登录。已记住的车机会保留，不用重新配对。")
                     .font(.system(size: 11))
                     .foregroundColor(UI.dim)
+
+                Text(MainView.versionText)
+                    .font(.system(size: 11))
+                    .foregroundColor(UI.dim.opacity(0.8))
             }
         }
         .actionSheet(isPresented: $showLogout) {
