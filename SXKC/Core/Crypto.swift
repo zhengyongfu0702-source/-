@@ -37,7 +37,9 @@ enum Crypto {
             throw CryptoError.aesFailed(-1)
         }
         var out = [UInt8](repeating: 0, count: data.count + blockSize)
-                let outCap = out.count
+        // 容量必须先取出来：下面 withUnsafeMutableBytes 的闭包持有 out 的独占写权限，
+        // 在闭包里再读 out.count 会触发 "overlapping accesses to 'out'" 编译错误。
+        let outCap = out.count
         var outLen = 0
         let status: CCCryptorStatus = key.withUnsafeBytes { keyPtr -> CCCryptorStatus in
             data.withUnsafeBytes { dataPtr -> CCCryptorStatus in
@@ -46,8 +48,8 @@ enum Crypto {
                             CCAlgorithm(kCCAlgorithmAES),
                             CCOptions(kCCOptionECBMode),
                             keyPtr.baseAddress, key.count, nil,
-                            dataPtr.baseAddress, outCap,
-                            outPtr.baseAddress, out.count,
+                            dataPtr.baseAddress, data.count,
+                            outPtr.baseAddress, outCap,
                             &outLen)
                 }
             }
