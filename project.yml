@@ -1,0 +1,76 @@
+name: SXKC
+
+options:
+  bundleIdPrefix: cn.sxkc
+  deploymentTarget:
+    iOS: "14.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+  generateEmptyDirectories: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    ENABLE_BITCODE: NO
+    # 关键：整条链路都不签名，产物是裸 .app，交给 TrollStore 用 ldid 伪签名
+    CODE_SIGNING_REQUIRED: NO
+    CODE_SIGNING_ALLOWED: NO
+    CODE_SIGN_IDENTITY: ""
+    CODE_SIGN_ENTITLEMENTS: ""
+
+targets:
+  SXKC:
+    type: application
+    platform: iOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: SXKC
+        excludes:
+          - "Info.plist"
+    info:
+      path: SXKC/Info.plist
+      properties:
+        CFBundleDisplayName: 顺心控车
+        CFBundleName: SXKC
+        CFBundleShortVersionString: "1.12"
+        CFBundleVersion: "13"
+        CFBundleDevelopmentRegion: zh_CN
+        LSRequiresIPhoneOS: true
+        UILaunchScreen: {}
+        UIStatusBarStyle: UIStatusBarStyleLightContent
+        UIViewControllerBasedStatusBarAppearance: false
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        NSBluetoothAlwaysUsageDescription: 需要连接车机蓝牙，用于开锁、锁车与靠近自动解锁。
+        NSBluetoothPeripheralUsageDescription: 需要连接车机蓝牙。
+        NSLocationWhenInUseUsageDescription: 部分系统在蓝牙扫描时需要定位权限。
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+        UIBackgroundModes:
+          - bluetooth-central
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: cn.sxkc.lite
+        PRODUCT_NAME: SXKC
+        TARGETED_DEVICE_FAMILY: "1"
+        MARKETING_VERSION: "1.12"
+        CURRENT_PROJECT_VERSION: "13"
+        GENERATE_INFOPLIST_FILE: NO
+        SWIFT_OPTIMIZATION_LEVEL: "-O"
+        ASSETCATALOG_COMPILER_APPICON_NAME: "AppIcon"
+
+schemes:
+  SXKC:
+    build:
+      targets:
+        SXKC: all
+    run:
+      config: Debug
+    profile:
+      config: Release
+    analyze:
+      config: Debug
+    archive:
+      config: Release

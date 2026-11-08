@@ -1,0 +1,11 @@
+# Xcode / 构建产物
+build/
+DerivedData/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+Payload/
+*.ipa
+.DS_Store
+
+# XcodeGen 生成物（用 project.yml 重新生成即可）
+SXKC.xcodeproj/
