@@ -32,11 +32,12 @@ targets:
       properties:
         CFBundleDisplayName: 顺心控车
         CFBundleName: SXKC
-        CFBundleShortVersionString: "1.13"
-        CFBundleVersion: "14"
+        CFBundleShortVersionString: "1.17"
+        CFBundleVersion: "18"
         CFBundleDevelopmentRegion: zh_CN
         LSRequiresIPhoneOS: true
         UILaunchScreen: {}
+        UIUserInterfaceStyle: Dark
         UIStatusBarStyle: UIStatusBarStyleLightContent
         UIViewControllerBasedStatusBarAppearance: false
         UIFileSharingEnabled: true
@@ -45,18 +46,20 @@ targets:
           - UIInterfaceOrientationPortrait
         NSBluetoothAlwaysUsageDescription: 需要连接车机蓝牙，用于开锁、锁车与靠近自动解锁。
         NSBluetoothPeripheralUsageDescription: 需要连接车机蓝牙。
-        NSLocationWhenInUseUsageDescription: 部分系统在蓝牙扫描时需要定位权限。
+        NSLocationWhenInUseUsageDescription: 用于计算手机与车辆的距离：靠近 10 米自动开锁，离开 30 米自动锁车。
+        NSLocationAlwaysAndWhenInUseUsageDescription: 锁屏后也要按距离判断是否开关锁。不需要后台判距时，请在 App 里关掉「后台持续定位」。
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
         UIBackgroundModes:
           - bluetooth-central
+          - location
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: cn.sxkc.lite
         PRODUCT_NAME: SXKC
         TARGETED_DEVICE_FAMILY: "1"
-        MARKETING_VERSION: "1.13"
-        CURRENT_PROJECT_VERSION: "14"
+        MARKETING_VERSION: "1.17"
+        CURRENT_PROJECT_VERSION: "18"
         GENERATE_INFOPLIST_FILE: NO
         SWIFT_OPTIMIZATION_LEVEL: "-O"
         ASSETCATALOG_COMPILER_APPICON_NAME: "AppIcon"
