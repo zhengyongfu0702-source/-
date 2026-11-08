@@ -154,6 +154,50 @@ enum Logic {
         return ch == CH_BLE ? "蓝牙" : "网络"
     }
 
+    // MARK: - 双通道竞速（1.16）
+
+    /// 这一笔该不该「两条通道同时发」。
+    ///
+    /// 竞速能成立的前提是两条通道**都还够得着**：没有网络会话、没有车机标识、
+    /// 蓝牙明显够不着时，起竞速等于白开一次连接。只有一条路时单通道更快也更省电。
+    ///
+    /// **启动 / 熄火永远不竞速**（写死在调用方）：那两条不幂等，重复触发会伤启动机。
+    static func shouldRace(hasTarget: Bool,
+                           connected: Bool,
+                           rssiAgeMs: Int64,
+                           rssi: Int,
+                           hasSession: Bool,
+                           _ c: Cfg?) -> Bool {
+        guard hasTarget, hasSession else { return false }
+        if connected { return true }
+        guard let c = c, rssiAgeMs >= 0 else {
+            // 从没读到过信号：希望不明，但并发一次不亏
+            return true
+        }
+        return rssiAgeMs <= c.bleReachMs && rssi >= c.bleThr
+    }
+
+    /// 门没关严就落锁 == 没锁。
+    ///
+    /// 门位字节目前还没逆出来（状态帧 body[3] 疑似事件码），所以 `doorKnown` 恒为 false，
+    /// 这个方法恒返回 false，**不改变现有行为**。等门位确认后把 known 传对即可生效。
+    static func doorBlocksLock(doorKnown: Bool, doorOpen: Bool) -> Bool {
+        return doorKnown && doorOpen
+    }
+
+    /// 围栏外的降耗判据：只有「确实离得很远、且结论可信」时才允许降到粗档。
+    ///
+    /// - Parameters:
+    ///   - dist: 手机与车的距离（米），NaN 表示算不出来
+    ///   - acc: 手机定位精度（米）
+    ///   - fenceM: 围栏半径（米）
+    static func canGoCoarse(dist: Double, acc: Double, fenceM: Double) -> Bool {
+        if dist.isNaN || fenceM <= 0 { return false }
+        if acc > 500 { return false }
+        // 留 20% 余量：漂到围栏边上就先升档，别等真的走到车边才反应
+        return dist > fenceM * 1.2
+    }
+
     /// 「车锁状态由未锁翻成已锁」的那一刻，人是不是就在车旁？
     ///
     /// 这个判断专门用来堵一个很危险的误触发：熄火下车、关门后车辆**自己上锁**，

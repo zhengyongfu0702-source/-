@@ -95,4 +95,15 @@ enum Frame {
         guard body.count > 5 else { return "--" }
         return String(format: "%02X", body[5])
     }
+
+    /// 这一帧是不是「事件帧」而不是「周期帧」。
+    ///
+    /// 实车日志里绝大多数状态帧的 body[3] 是 0x00（3 秒一帧的心跳），
+    /// 但开锁后 10 秒、长时间停放后各出现过一次 body[3]=0x0F，其余字节结构也不同。
+    /// 这很可能就是车门 / 遥控事件的入口 —— 门位大概率藏在这类帧里。
+    ///
+    /// 现在只做识别与记录（整帧 hex 进日志），不动任何动作。
+    static func isEventBody(_ body: [UInt8]) -> Bool {
+        return body.count > 3 && body[3] != 0x00
+    }
 }

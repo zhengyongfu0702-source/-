@@ -21,6 +21,27 @@ enum StoreKey {
     static let peripheralId = "peripheral_id"
     /// iOS 专用：车机蓝牙名，仅用于日志与识别提示（不参与匹配）
     static let peripheralName = "peripheral_name"
+
+    // MARK: 定位（1.14 起）
+
+    /// 定位判距总开关。关掉就完全回到蓝牙 RSSI 判据
+    static let geoOn = "geo_on"
+    /// 是否申请后台持续定位（false = 只在 App 前台时定位）
+    static let locBg = "loc_bg"
+    /// 靠近门限（米）
+    static let geoNearM = "geo_near_m"
+    /// 离开门限（米）
+    static let geoFarM = "geo_far_m"
+    /// 地理围栏降耗：离车很远时降到粗档
+    static let fenceOn = "fence_on"
+    /// 双通道竞速：蓝牙与网络同时下发
+    static let raceOn = "race_on"
+    /// 洗车 / 代客模式截止时刻（毫秒）
+    static let washUntil = "wash_until"
+    /// 自动动作的通知与震动
+    static let notifyOn = "notify_on"
+    /// 门没关严不落锁（门位未确认前恒不生效）
+    static let doorGuard = "door_guard"
 }
 
 final class Store {
@@ -137,5 +158,76 @@ final class Store {
         c.awayMs = Int64(awaySeconds) * 1000
         c.bleThr = bleLockThr
         return c
+    }
+
+    // MARK: - 定位
+
+    /// 定位判距总开关。默认**开**：这一版的重点就是它，装完不用去设置里翻。
+    var geoOn: Bool {
+        get { return flag(StoreKey.geoOn, true) }
+        set { putFlag(StoreKey.geoOn, newValue) }
+    }
+
+    /// 后台持续定位。默认**关**：先按省电跑，用户需要锁屏也生效时自己打开。
+    var locBg: Bool {
+        get { return flag(StoreKey.locBg, false) }
+        set { putFlag(StoreKey.locBg, newValue) }
+    }
+
+    /// 靠近门限（米）。实车上 GPS 抖 3~5 米很常见，默认 10 米，
+    /// 觉得「走到车边要等一下才开」就调到 12~15。
+    var geoNearM: Double {
+        get {
+            let v = d.object(forKey: StoreKey.geoNearM) as? Double ?? 10
+            return v < 3 ? 10 : v
+        }
+        set { d.set(newValue, forKey: StoreKey.geoNearM) }
+    }
+
+    /// 离开门限（米）。保持「至少是靠近门限的 2 倍」，中间那段是死区。
+    var geoFarM: Double {
+        get {
+            let v = d.object(forKey: StoreKey.geoFarM) as? Double ?? 30
+            if v <= geoNearM { return geoNearM * 2 }
+            return v
+        }
+        set { d.set(newValue, forKey: StoreKey.geoFarM) }
+    }
+
+    var geoCfg: Geo.Cfg {
+        var c = Geo.Cfg()
+        c.enabled = geoOn
+        c.autoUnlock = autoUnlock
+        c.autoLock = autoLock
+        c.inM = geoNearM
+        c.outM = geoFarM
+        c.awayMs = Int64(awaySeconds) * 1000
+        c.unlockCooldownMs = 60_000
+        c.lockCooldownMs = 60_000
+        return c
+    }
+
+    /// 围栏降耗。默认**开**：精度只在需要时花钱。
+    var fenceOn: Bool {
+        get { return flag(StoreKey.fenceOn, true) }
+        set { putFlag(StoreKey.fenceOn, newValue) }
+    }
+
+    /// 双通道竞速。默认**开**：两条都是幂等指令，并发没有副作用。
+    var raceOn: Bool {
+        get { return flag(StoreKey.raceOn, true) }
+        set { putFlag(StoreKey.raceOn, newValue) }
+    }
+
+    /// 通知与震动。默认**开**。
+    var notifyEnabled: Bool {
+        get { return flag(StoreKey.notifyOn, true) }
+        set { putFlag(StoreKey.notifyOn, newValue) }
+    }
+
+    /// 洗车 / 代客模式的截止时刻；0 表示没开
+    var washUntil: Int64 {
+        get { return lng(StoreKey.washUntil, 0) }
+        set { putLng(StoreKey.washUntil, newValue) }
     }
 }
