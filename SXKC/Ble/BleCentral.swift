@@ -562,9 +562,11 @@ final class BleCentral: NSObject {
             // 状态帧只在 flags 字节变化时记一行，且把整帧明文带上 ——
             // 之前只记 armed 的布尔值，01/11/21 之间的来回跳完全看不出来。
             let fl = Frame.statusFlags(b)
-            if lastStatusFlags != fl {
+            // 事件帧（body[3]!=0）即使 flags 没变也要记 —— 门位大概率就藏在这类帧里
+            let event = Frame.isEventBody(b)
+            if lastStatusFlags != fl || event {
                 lastStatusFlags = fl
-                log("状态帧 flags=\(fl) \(armed ? "已锁" : "未锁") body=\(Hex.of(b))")
+                log((event ? "· 事件帧 " : "状态帧 ") + "flags=\(fl) \(armed ? "已锁" : "未锁") body=\(Hex.of(b))")
             }
             delegate?.bleArmed(self, armed)
             if busy && !done && armed == !wantUnlock {
