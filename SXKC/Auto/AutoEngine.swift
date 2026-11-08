@@ -3,7 +3,7 @@ import Combine
 import CoreBluetooth
 import UIKit
 
-/// 自动模式引擎（iOS 版 1.12）。
+/// 自动模式引擎（iOS 版 1.13）。
 ///
 /// ## 和 Android 的根本差异：这里一个定时器都没有
 ///
@@ -62,6 +62,8 @@ final class AutoEngine: NSObject, ObservableObject {
     private var rssiSmooth = -127
     private var reconnectFails = 0
     private var nextReconnectAt: Int64 = 0
+    /// 断线重试令牌：重新排一次就把旧的那次作废，避免每次断开都叠一个定时器
+    private var reconnectToken = 0
 
     private var pendingUnlock = false
     private var pendingChannel = 0
@@ -194,11 +196,15 @@ final class AutoEngine: NSObject, ObservableObject {
         guard !running else { return }
         running = true
         store.autoOn = true
+        ble.clearDiagMode()
         ble.setKeepAlive(true)
         log("▶ 自动模式开启（事件驱动：连上判开锁、断开判锁车，不再定时唤醒）")
         ensureSession { ok in
             if !ok { self.log("⚠︎ 没有有效会话，网络通道不可用（蓝牙仍可用）") }
         }
+        // 手动开启自动模式 = 用户现在就要用，退避计数从头算
+        reconnectFails = 0
+        nextReconnectAt = 0
         ble.ensureConnected()
     }
 
@@ -217,6 +223,9 @@ final class AutoEngine: NSObject, ObservableObject {
         st.awayTicks = 0
         st.lastNearAt = 0
         lockedForThisVisit = false
+        reconnectToken += 1          // 作废挂着的那次断线重试
+        reconnectFails = 0
+        nextReconnectAt = 0
         log("■ 自动模式关闭")
         powerText = ""
     }
@@ -239,6 +248,8 @@ final class AutoEngine: NSObject, ObservableObject {
         lastUnlockAt = 0
         lastLockAt = 0
         lastPollAt = 0
+        lastNetAt = 0
+        netRetried = false
         lastResult = ""
         car = nil
         lockedForThisVisit = false
@@ -371,8 +382,17 @@ final class AutoEngine: NSObject, ObservableObject {
             : Logic.lockChannel(hasTarget: ble.hasSavedTarget, connected: ble.isConnected,
                                 rssiAgeMs: rssiAge, rssi: lastRssiValue, cfg)
 
-        let ageText = rssiAge < 0 ? "无记录" : "\(rssiAge / 1000)s 前"
-        log("通道选择：\(Logic.channelName(ch))（信号 \(lastRssiValue)dBm，\(ageText)）")
+        // 信号值只在「还在有效期内」时才有意义：-127 是没读到的哨兵值，
+        // 67 秒前的 -90dBm 也不代表现在离车多远，直接打出来只会误导。
+        let sigText: String
+        if rssiAge < 0 || lastRssiValue <= -120 {
+            sigText = "无信号记录"
+        } else if rssiAge > cfg.bleReachMs {
+            sigText = "\(lastRssiValue)dBm 已过期（\(rssiAge / 1000)s 前）"
+        } else {
+            sigText = "\(lastRssiValue)dBm（\(rssiAge / 1000)s 前）"
+        }
+        log("通道选择：\(Logic.channelName(ch))（\(sigText)）")
         pendingUnlock = unlock
         pendingChannel = ch
         acting = true
@@ -391,7 +411,25 @@ final class AutoEngine: NSObject, ObservableObject {
         }
     }
 
+    /// 服务端对同一账号的连续控制有频率限制：实测「锁车成功后 2 秒再开锁」直接回
+    /// `TE2026 操作过快`，指令白丢一条。本地先等够 4 秒再发，别让用户看到莫名其妙的失败。
+    private let netMinGapMs: Int64 = 4000
+    private var lastNetAt: Int64 = 0
+    /// TE2026 只自动重试一次，避免撞上限频时死循环
+    private var netRetried = false
+
     private func netPerform(unlock: Bool) {
+        let now = CarAPI.nowMs()
+        if lastNetAt > 0 && now - lastNetAt < netMinGapMs {
+            let waitMs = netMinGapMs - (now - lastNetAt)
+            let waitS = (waitMs + 999) / 1000
+            log("⚠︎ 距上一条网络指令不足 \(netMinGapMs / 1000)s，等 \(waitS)s 再发（服务端限频）")
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(Int(waitMs))) { [weak self] in
+                self?.netPerform(unlock: unlock)
+            }
+            return
+        }
+        lastNetAt = now
         ensureSession { ok in
             guard ok else {
                 self.acting = false
@@ -403,12 +441,22 @@ final class AutoEngine: NSObject, ObservableObject {
                 do {
                     let r = unlock ? (try self.api.unlock()) : (try self.api.lock())
                     DispatchQueue.main.async {
-                        self.acting = false
                         if r.ok {
+                            self.acting = false
+                            self.netRetried = false
                             self.markDone(unlock: unlock, channel: Logic.CH_NET)
                             self.log("✓ 网络\(unlock ? "开锁" : "锁车")成功")
                             self.lastResult = "网络成功"
+                        } else if (r.code == "TE2026" || r.msg.contains("过快")) && !self.netRetried {
+                            self.netRetried = true
+                            self.lastNetAt = 0     // 重试不再受本地冷却挡
+                            self.log("✗ 网络失败 \(r.code) \(r.msg) → 3 秒后自动重试一次")
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
+                                self?.netPerform(unlock: unlock)
+                            }
                         } else {
+                            self.acting = false
+                            self.netRetried = false
                             self.log("✗ 网络失败 \(r.code) \(r.msg)")
                             self.lastResult = "网络失败 \(r.code)"
                         }
@@ -416,6 +464,7 @@ final class AutoEngine: NSObject, ObservableObject {
                 } catch {
                     DispatchQueue.main.async {
                         self.acting = false
+                        self.netRetried = false
                         self.log("✗ 网络异常 \(error.localizedDescription)")
                         self.lastResult = "网络异常"
                     }
@@ -564,9 +613,11 @@ final class AutoEngine: NSObject, ObservableObject {
     /// 改成「一进前台就补一次真实状态」——这也正是用户最需要看到最新状态的时候。
     func onForeground() {
         guard signedIn else { return }
+        log("· 回到前台")
         lastPollAt = CarAPI.nowMs()
         refreshStatus()
         if running {
+            // 顺手把连接催一下：ensureConnected 内部有 4 秒间隔，不会因为来回切前后台就狂连
             ble.ensureConnected()
             evaluate("回到前台")
         }
@@ -696,6 +747,23 @@ extension AutoEngine: BleCentralDelegate {
                 nextReconnectAt = CarAPI.nowMs() + d
                 reconnectFails = min(reconnectFails + 1, 6)
                 log("已断开，\(d / 1000)s 后重连")
+                // 两个动作缺一不可：
+                // 1) 立刻提交一次 connect。App 被挂起后 DispatchQueue 的定时器一律不跑，
+                //    只有「已经交给 CoreBluetooth 的连接请求」能在后台替我们等车机重新广播
+                //    —— 这是 iOS 上唯一的自动重连手段。
+                ble.ensureConnected()
+                // 2) 前台再补一次定时重试。didFailToConnect 不会回调到这一层，
+                //    只有上面那一次提交失败的话，就再也连不上了（原来日志里断开后就一直
+                //    挂着，直到用户手动点一下才恢复，就是这个原因）。
+                reconnectToken += 1
+                let tk = reconnectToken
+                DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(Int(d))) { [weak self] in
+                    guard let self = self, self.reconnectToken == tk,
+                          self.running, !self.ble.isConnected else { return }
+                    self.nextReconnectAt = 0
+                    self.ble.ensureConnected()
+                    self.evaluate("重连重试")
+                }
             }
         }
     }
