@@ -1,0 +1,59 @@
+name: build-ipa
+
+# 在 GitHub 免费 macOS 机器上编译出「未签名 .ipa」，下载后用 TrollStore 安装
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 25
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 显示 Xcode 版本
+        run: xcodebuild -version
+
+      - name: 安装 XcodeGen
+        run: brew install xcodegen
+
+      - name: 生成 Xcode 工程
+        run: xcodegen generate
+
+      - name: 编译（不签名）
+        run: |
+          xcodebuild \
+            -project SXKC.xcodeproj \
+            -scheme SXKC \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            build
+
+      - name: 打包成 ipa
+        run: |
+          APP="build/Build/Products/Release-iphoneos/SXKC.app"
+          ls -la "$APP"
+          rm -rf Payload
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry SXKC-unsigned.ipa Payload
+          ls -lh SXKC-unsigned.ipa
+          echo "---- 架构检查 ----"
+          lipo -info "$APP/SXKC"
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: SXKC-unsigned-ipa
+          path: SXKC-unsigned.ipa
+          retention-days: 30
