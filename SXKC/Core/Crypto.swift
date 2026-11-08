@@ -37,6 +37,7 @@ enum Crypto {
             throw CryptoError.aesFailed(-1)
         }
         var out = [UInt8](repeating: 0, count: data.count + blockSize)
+                let outCap = out.count
         var outLen = 0
         let status: CCCryptorStatus = key.withUnsafeBytes { keyPtr -> CCCryptorStatus in
             data.withUnsafeBytes { dataPtr -> CCCryptorStatus in
@@ -45,7 +46,7 @@ enum Crypto {
                             CCAlgorithm(kCCAlgorithmAES),
                             CCOptions(kCCOptionECBMode),
                             keyPtr.baseAddress, key.count, nil,
-                            dataPtr.baseAddress, data.count,
+                            dataPtr.baseAddress, outCap,
                             outPtr.baseAddress, out.count,
                             &outLen)
                 }
