@@ -73,6 +73,9 @@ final class CarAPI {
     static let CODE_STATUS = "203100"
     static let CODE_LOCK = "303110"
     static let CODE_UNLOCK = "303115"
+    /// 一键启动 / 熄火。实车抓包得来：303120 = 启动，303125 = 熄火
+    static let CODE_START = "303120"
+    static let CODE_STOP = "303125"
 
     var uid = ""
     var ssk = ""
@@ -240,6 +243,10 @@ final class CarAPI {
 
     func lock() throws -> Resp { return try send(CarAPI.CODE_LOCK) }
     func unlock() throws -> Resp { return try send(CarAPI.CODE_UNLOCK) }
+    /// 一键启动（远程着车）。走网络，不需要蓝牙在附近。
+    func startEngine() throws -> Resp { return try send(CarAPI.CODE_START) }
+    /// 熄火
+    func stopEngine() throws -> Resp { return try send(CarAPI.CODE_STOP) }
 
     // MARK: 状态
 
