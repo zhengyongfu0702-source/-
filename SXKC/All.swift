@@ -3469,7 +3469,7 @@ final class AutoEngine: NSObject, ObservableObject {
     /// 参与了编译，界面上才会跟着变。
     ///
     /// 每次改源码就换一个值，装完瞄一眼底部就知道装的是哪一次构建。
-    static let buildTag = "b1109y"
+    static let buildTag = "b1109z"
 
     let ble = BleCentral()
     let api = CarAPI()
@@ -3676,6 +3676,19 @@ final class AutoEngine: NSObject, ObservableObject {
         Notify.shared.setup()
         log("iOS 版启动")
         log("提示：iOS 拿不到车机 MAC，改用 0xFFE0 指纹 + 已记住的 identifier 连接")
+
+        // 自动模式必须跨启动保留。
+        //
+        // `store.autoOn` 从 1.19 起就一直在写（start/stop 都写），但**从来没有
+        // 任何地方读回来** —— 于是进程一结束 `running` 就回到初值 false，
+        // 用户看到的就是「退出软件再打开，自动靠近开锁自己变成关闭」。
+        // 安卓那边是在 MainActivity onCreate 里读 K_AUTO 重新拉起服务的，
+        // iOS 缺的正是这一步。
+        if signedIn && store.autoOn {
+            beginAuto(restoring: true)
+        } else if signedIn {
+            whyText = "自动模式已关闭"
+        }
     }
 
     /// 138****8888：够认出是谁，又不会在别人面前裸奔
@@ -3772,18 +3785,30 @@ final class AutoEngine: NSObject, ObservableObject {
 
     // MARK: 自动模式
 
-    func start() {
+    func start() { beginAuto(restoring: false) }
+
+    /// 真正的开启动作。`restoring` 只影响第一条日志文案。
+    ///
+    /// 拆出来的原因：冷启动时要把上次开着的自动模式接回来，而「接回来」必须和
+    /// 手动点开**完全一样**。只写 `running = true` 是不够的 —— 那样界面显示
+    /// 「已开启」，但保活心跳、定位、重连一个都没挂上，等于假装开着：
+    /// 用户以为靠近会开锁，走到车边却毫无反应，比明确显示"关闭"更糟。
+    private func beginAuto(restoring: Bool) {
         guard !running else { return }
         running = true
         store.autoOn = true
         ble.clearDiagMode()
         ble.setKeepAlive(true)
-        log("▶ 自动模式开启（定位判距为主，蓝牙兜底；后台仍靠连接/断开事件）")
+        if restoring {
+            log("↻ 自动模式按上次的状态恢复开启（离开 App 前是开着的）")
+        } else {
+            log("▶ 自动模式开启（定位判距为主，蓝牙兜底；后台仍靠连接/断开事件）")
+        }
         log("· 构建 \(AutoEngine.buildTag) · 门位解析已启用")
         ensureSession { ok in
             if !ok { self.log("⚠︎ 没有有效会话，网络通道不可用（蓝牙仍可用）") }
         }
-        // 手动开启自动模式 = 用户现在就要用，退避计数从头算
+        // 开启自动模式 = 用户现在就要用，退避计数从头算
         reconnectFails = 0
         nextReconnectAt = 0
         if store.geoOn { startLoc() }
@@ -3816,6 +3841,9 @@ final class AutoEngine: NSObject, ObservableObject {
         distText = ""
         log("■ 自动模式关闭")
         powerText = ""
+        // 不清的话，状态卡会一直挂着关掉之前那句「在车旁 · 车是锁着的状态」，
+        // 看着像还在工作。
+        whyText = "自动模式已关闭"
     }
 
     // MARK: 退出登录（换账号）
@@ -3992,7 +4020,7 @@ final class AutoEngine: NSObject, ObservableObject {
     /// 1.22 新增。以前这些理由只写在日志里，用户想知道「刚才走到车边为什么没开锁」
     /// 只能去诊断页逐条翻 —— 而这恰恰是最常被问的问题。
     private func refreshWhy(_ now: Int64) {
-        if !store.flag(StoreKey.autoOn, true) { whyText = "自动模式已关闭"; return }
+        if !running { whyText = "自动模式已关闭"; return }
         if store.washUntil > now { whyText = "洗车 / 代客模式：自动判定已暂停（手动照常）"; return }
         if netPendAt > 0 { whyText = "指令已发出，等车机确认…"; return }
         if doorWaitUntil > 0 { whyText = "正在确认车门状态，最多等 8 秒…"; return }
