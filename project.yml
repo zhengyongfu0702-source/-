@@ -16,24 +16,40 @@ settings:
     CODE_SIGNING_REQUIRED: NO
     CODE_SIGNING_ALLOWED: NO
     CODE_SIGN_IDENTITY: ""
-    CODE_SIGN_ENTITLEMENTS: ""
+    # 注意：这里不能再写 CODE_SIGN_ENTITLEMENTS: ""
+    # 那会把下面 entitlements 段生成的路径覆盖掉，App Group 就没了，
+    # 小组件会一直显示「状态未知」。
 
 targets:
   SXKC:
     type: application
     platform: iOS
     deploymentTarget: "14.0"
+    # ────────────────────────────────────────────────────────────────
+    # 白名单：只编译这两个文件。
+    # SharedKit.swift 必须同时出现在这里和小组件 target 里 ——
+    # 它是两边共用的数据结构，各编一份、用同一个 group id 才能对上。
+    #
+    # 仓库里原来 SXKC/Core、SXKC/UI 等目录的文件不用删，
+    # 它们不在清单里，就不会被编译，也不会和 All.swift 撞名。
+    # ────────────────────────────────────────────────────────────────
     sources:
-      - path: SXKC
-        excludes:
-          - "Info.plist"
+      - path: SXKC/All.swift
+      - path: SXKC/SharedKit.swift
+    dependencies:
+      - target: SXKCWidget
+    entitlements:
+      path: SXKC/SXKC.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.cn.sxkc.lite
     info:
       path: SXKC/Info.plist
       properties:
         CFBundleDisplayName: 顺心控车
         CFBundleName: SXKC
-        CFBundleShortVersionString: "1.19"
-        CFBundleVersion: "19"
+        CFBundleShortVersionString: "1.21"
+        CFBundleVersion: "21"
         CFBundleDevelopmentRegion: zh_CN
         LSRequiresIPhoneOS: true
         UILaunchScreen: {}
@@ -53,16 +69,50 @@ targets:
         UIBackgroundModes:
           - bluetooth-central
           - location
+        # 小组件上的按钮靠这个 scheme 把 App 拉起来
+        CFBundleURLTypes:
+          - CFBundleURLName: cn.sxkc.lite.url
+            CFBundleURLSchemes:
+              - sxkc
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: cn.sxkc.lite
         PRODUCT_NAME: SXKC
         TARGETED_DEVICE_FAMILY: "1"
-        MARKETING_VERSION: "1.19"
-        CURRENT_PROJECT_VERSION: "19"
+        MARKETING_VERSION: "1.21"
+        CURRENT_PROJECT_VERSION: "21"
         GENERATE_INFOPLIST_FILE: NO
         SWIFT_OPTIMIZATION_LEVEL: "-O"
         ASSETCATALOG_COMPILER_APPICON_NAME: "AppIcon"
+
+  SXKCWidget:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: SXKC/SharedKit.swift
+      - path: SXKC/SXKCWidget.swift
+    entitlements:
+      path: SXKC/SXKCWidget.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.cn.sxkc.lite
+    info:
+      path: SXKC/SXKCWidgetInfo.plist
+      properties:
+        CFBundleDisplayName: 顺心控车小组件
+        CFBundleShortVersionString: "1.21"
+        CFBundleVersion: "21"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: cn.sxkc.lite.widget
+        PRODUCT_NAME: SXKCWidget
+        SKIP_INSTALL: YES
+        TARGETED_DEVICE_FAMILY: "1"
+        GENERATE_INFOPLIST_FILE: NO
+        SWIFT_OPTIMIZATION_LEVEL: "-O"
 
 schemes:
   SXKC:
