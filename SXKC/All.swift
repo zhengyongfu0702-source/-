@@ -801,6 +801,46 @@ enum Logic {
     /// 通道：网络（蓝牙够不着或蓝牙失败后的兜底）
     static let CH_NET = 2
 
+    // MARK: 指令通道模式（1.26）
+
+    /// 智能：蓝牙优先，够不着自动转网络，够得着时两条并发。默认值。
+    static let MODE_SMART = 0
+    /// 仅蓝牙：一条网络指令都不发。省流量、不受云端抖动影响，
+    /// 代价是蓝牙连不上时这一笔就放弃（不会偷偷走网络）。
+    static let MODE_BLE = 1
+    /// 仅网络：指令全走云端。蓝牙仍然连着，只用来读车锁 / 门位状态帧 ——
+    /// 不读状态就没有「车现在锁没锁」，整个判定都无从谈起。
+    static let MODE_NET = 2
+
+    static func modeName(_ m: Int) -> String {
+        if m == MODE_BLE { return "仅蓝牙" }
+        if m == MODE_NET { return "仅网络" }
+        return "智能"
+    }
+
+    /// 按模式挑选下发通道。模式是硬约束，不参与「够不够得着」的判断 ——
+    /// 用户选了仅蓝牙，就不该有任何一条指令偷偷走网络。
+    static func pickCh(_ mode: Int,
+                       unlock: Bool,
+                       hasTarget: Bool,
+                       connected: Bool,
+                       rssiAgeMs: Int64,
+                       rssi: Int,
+                       _ c: Cfg?) -> Int {
+        if mode == MODE_BLE { return CH_BLE }
+        if mode == MODE_NET { return CH_NET }
+        return unlock
+            ? unlockChannel(hasTarget: hasTarget, connected: connected,
+                            rssiAgeMs: rssiAgeMs, rssi: rssi, c)
+            : lockChannel(hasTarget: hasTarget, connected: connected,
+                          rssiAgeMs: rssiAgeMs, rssi: rssi, c)
+    }
+
+    /// 这个模式下是否允许并发。仅蓝牙 / 仅网络都是单通道，谈不上竞速。
+    static func modeAllowsRace(_ mode: Int) -> Bool {
+        return mode == MODE_SMART
+    }
+
     /// 一次决策所需的全部输入
     struct St {
         var connected = true
@@ -809,6 +849,12 @@ enum Logic {
         var moving = false
         var busy = false
         var fresh = false
+        /// RSSI 本身是否新鲜（10 秒内读到过）。
+        ///
+        /// 1.26 起与 `fresh`（状态帧新鲜）分开：状态帧 3 秒一帧，但车机在省电、
+        /// 刚回连、或只推了半帧的情况下，`fresh` 会是 false，而此时 RSSI 明明
+        /// 强得贴车。原来 `near` 同时要求两者，结果就是「人站在车门上，车不开」。
+        var rssiFresh = false
         var rssi = -127
         var now: Int64 = 0
         var lastSeen: Int64 = 0
@@ -821,6 +867,13 @@ enum Logic {
         var visited = false
         /// 本次到访已经自动开过锁（防止车辆自身回锁后又被反复开锁）
         var unlockedThisVisit = false
+        /// 车锁状态最近一次「未锁 → 已锁」翻转的时刻（毫秒）。
+        ///
+        /// 1.26 新增。这个时间决定「车自己上锁后，人还在车旁多久才允许再开」：
+        /// 原来一律要「走开 30 秒再回来」，于是下车关门、车一自锁，人就再也
+        /// 拉不开门了 —— 用户说的罚站，很多是这一条。自锁回环只发生在几秒内，
+        /// 用 20 秒的持续在旁作确认，既挡住回环又不会把人关在门外。
+        var flipAt: Int64 = 0
         /// 连续多少拍判定为「已离开」，用于抗丢包
         var awayTicks = 0
     }
@@ -852,7 +905,12 @@ enum Logic {
         let nearRef = s.lastNearAt > 0 ? s.lastNearAt : s.lastSeen
         let awayLong = nearRef > 0 && (s.now - nearRef) > c.awayMs
 
-        let near = s.connected && s.fresh && s.rssi >= c.thr
+        // 「在车旁」= 连着、信号强于开锁门限，且**状态帧或 RSSI 有一份是新的**。
+        //
+        // 1.26 改掉「必须状态帧新鲜」：状态帧断了但 RSSI 还在刷，说明车机就在旁边
+        // 只是不肯推帧（车机省电、刚回连、地库信号差）。这时人拉门把手，车不开 ——
+        // 用户看到的就是「罚站」。RSSI 强于门限本身已经足够证明人在车边。
+        let near = s.connected && s.rssi >= c.thr && (s.fresh || s.rssiFresh)
         if near {
             s.visited = true
             s.awayTicks = 0
@@ -871,6 +929,17 @@ enum Logic {
 
         // 离开得足够久 → 下一次靠近算「新的一次到访」，允许再开一次锁
         if awayLongNow {
+            s.unlockedThisVisit = false
+        }
+
+        // 车刚自锁、人却一直待在车旁 → 解除「本次到访已开过」的抑制。
+        //
+        // 现场：下车关门，车辆自动上锁（未锁→已锁），人转身想在副驾拿包。
+        // 1.25 及以前这里要把「走开 30 秒」当解除条件，于是门怎么拉都不开。
+        // 20 秒是权衡：自锁回环在 1~3 秒内就会暴露，20 秒足够挡住；
+        // 而真心想上车的人不会在车边干站 20 秒还不碰门。
+        if s.armed && s.unlockedThisVisit && near && s.flipAt > 0
+            && (s.now - s.flipAt) > 20000 {
             s.unlockedThisVisit = false
         }
 
@@ -1091,6 +1160,24 @@ enum Logic {
     static func bleUsable(connected: Bool, rssiFresh: Bool, rssi: Int, unlockThr: Int) -> Bool {
         guard connected, rssiFresh else { return false }
         return rssi >= unlockThr - BLE_REACH_SLACK_DB
+    }
+
+    /// 蓝牙信号是否**足够开锁**：连着、读数新鲜、且达到用户设的开锁门限。
+    ///
+    /// 1.26 把这件事从 `bleUsable` 里拆出来。原来只有一个「可用」，它同时兼职：
+    ///   - 省电：可用就停定位
+    ///   - 锁车否决：可用就不锁车
+    ///   - 开锁：可用就当人在车边
+    ///
+    /// 前两件要宽松（-78 也算，避免定位反复启停、避免误锁），第三件必须严格
+    /// （到 `thr` 才算，否则门开不了）。混用之后，-78~-72 这一段成了黑洞：
+    /// 定位被停掉、开锁又不达标 —— 人站在车门边，App 什么都不做。
+    ///
+    /// - Parameter rssiFresh: 这里的「新鲜」用 10 秒窗口（`RSSI_FRESH_MS`），
+    ///   比 `bleUsable` 的 60 秒严。开锁要的是「此刻信号确实强」，不是「一分钟前强过」。
+    static func bleStrong(connected: Bool, rssiFresh: Bool, rssi: Int, unlockThr: Int) -> Bool {
+        guard connected, rssiFresh else { return false }
+        return rssi >= unlockThr
     }
 
     /// 走远锁车的最终判据。
@@ -1581,6 +1668,8 @@ enum StoreKey {
     static let fenceOn = "fence_on"
     /// 双通道竞速：蓝牙与网络同时下发
     static let raceOn = "race_on"
+    /// 指令通道模式（1.26）：0 智能 / 1 仅蓝牙 / 2 仅网络
+    static let chMode = "ch_mode"
     /// 洗车 / 代客模式截止时刻（毫秒）
     static let washUntil = "wash_until"
     /// 自动动作的通知与震动
@@ -1766,6 +1855,19 @@ final class Store {
     var raceOn: Bool {
         get { return flag(StoreKey.raceOn, true) }
         set { putFlag(StoreKey.raceOn, newValue) }
+    }
+
+    /// 指令通道模式（1.26）。默认智能：蓝牙优先，够不着转网络。
+    ///
+    /// 用户明确要求能自己选：「纯蓝牙使用」「网络和蓝牙自由选择、也能一起共用」。
+    /// 这个值只影响**指令下发**，不影响判定 —— 车锁状态、门位只能从蓝牙状态帧读，
+    /// 所以选「仅网络」时蓝牙照样连着，只是不下发开锁 / 锁车指令。
+    var chMode: Int {
+        get {
+            let v = num(StoreKey.chMode, Logic.MODE_SMART)
+            return (v == Logic.MODE_BLE || v == Logic.MODE_NET) ? v : Logic.MODE_SMART
+        }
+        set { putNum(StoreKey.chMode, newValue) }
     }
 
     /// 通知与震动。默认**开**。
@@ -3545,7 +3647,7 @@ final class AutoEngine: NSObject, ObservableObject {
     /// 参与了编译，界面上才会跟着变。
     ///
     /// 每次改源码就换一个值，装完瞄一眼底部就知道装的是哪一次构建。
-    static let buildTag = "b110a0"
+    static let buildTag = "b110a2"
 
     let ble = BleCentral()
     let api = CarAPI()
@@ -3596,6 +3698,8 @@ final class AutoEngine: NSObject, ObservableObject {
     @Published var notifyEnabled = false
     /// 门没关好就不自动落锁（v1.19）
     @Published var doorGuardEnabled = true
+    /// 指令通道模式（1.26，界面绑定）：0 智能 / 1 仅蓝牙 / 2 仅网络
+    @Published var chMode = Logic.MODE_SMART
     /// 洗车模式剩余文案；空串表示没开
     @Published var washText = ""
     /// 罚站率统计摘要
@@ -3754,6 +3858,7 @@ final class AutoEngine: NSObject, ObservableObject {
         doorGuardEnabled = store.flag(StoreKey.doorGuard, true)
         fenceEnabled = store.fenceOn
         notifyEnabled = store.notifyEnabled
+        chMode = store.chMode
         locText = loc.statusText
         statsText = Stats.summary()
         Notify.shared.setup()
@@ -3911,6 +4016,7 @@ final class AutoEngine: NSObject, ObservableObject {
         unlockFallbackRounds = 0
         st.visited = false
         st.unlockedThisVisit = false
+        st.flipAt = 0
         st.awayTicks = 0
         st.lastNearAt = 0
         geoSt = Geo.St()
@@ -4101,22 +4207,37 @@ final class AutoEngine: NSObject, ObservableObject {
         if store.washUntil > now { whyText = "洗车 / 代客模式：自动判定已暂停（手动照常）"; return }
         if netPendAt > 0 { whyText = "指令已发出，等车机确认…"; return }
         if doorWaitUntil > 0 { whyText = "正在确认车门状态，最多等 8 秒…"; return }
+        if store.chMode == Logic.MODE_BLE && !ble.isConnected {
+            whyText = "仅蓝牙模式 · 正在重连车机（连不上这一笔就放弃）"
+            return
+        }
         if !armedKnown { whyText = "还没收到车锁状态"; return }
 
         let farM = Int(Logic.farLockM(store.geoFarM))
 
         // ── 蓝牙有信号：主路径，正常状态不必解释 ──
         if ble.isConnected {
+            if st.unlockedThisVisit && armed {
+                whyText = "车辆刚自己上锁 · 在车旁持续 20 秒或走开再回来才会自动开"
+                return
+            }
             if isNearNow() {
                 if !armed {
-                    whyText = "在车旁 · 车是锁着的状态"
+                    whyText = "在车旁 · 车是开着的"
                 } else if st.unlockedThisVisit {
                     whyText = "本次到访已开过锁；走开再回来才会自动开"
                 } else {
                     whyText = "在车旁 · 开锁冷却中"
                 }
             } else {
-                whyText = "蓝牙已连接 · 走远到 \(farM) 米外才会自动锁"
+                // 1.26：把「差多少」直接写出来。用户在门口罚站时，最想知道的
+                // 就是「-75 差 3dB 到不了 -72」，而不是一句「蓝牙已连接」。
+                let r = rssiSmooth
+                if r > -120 && r < store.cfg.thr {
+                    whyText = "信号 \(r)dBm 未达门限 \(store.cfg.thr)dBm · 正在用定位兜底"
+                } else {
+                    whyText = "蓝牙已连接 · 走远到 \(farM) 米外才会自动锁"
+                }
             }
             return
         }
@@ -4222,6 +4343,7 @@ final class AutoEngine: NSObject, ObservableObject {
         let gcfg = store.geoCfg
 
         let rssiFresh = lastRssiAt > 0 && (now - lastRssiAt) < Logic.RSSI_FRESH_MS
+        st.rssiFresh = rssiFresh
         let near = Logic.nearAssumeByLink(rssi: rssiSmooth, thr: cfg.thr,
                                           fresh: rssiFresh, frameCount: recentFrameCount(now))
         st.rssi = near && !rssiFresh ? cfg.thr : rssiSmooth
@@ -4230,21 +4352,45 @@ final class AutoEngine: NSObject, ObservableObject {
         // 否则「走开再回来」的语义会丢。动作由下面的策略决定，不由它决定。
         let bleAct = Logic.decide(&st, cfg)
 
+        // ── 仅蓝牙模式：定位完全不参与 ──
+        // 用户选「纯蓝牙」要的就是：不取 GPS、不发网络。判定全交给 RSSI 与状态帧，
+        // 锁车退回「断开够久」。这里必须提前返回，否则下面会照样拉起定位。
+        if store.chMode == Logic.MODE_BLE {
+            stopGeoForBle()
+            return bleAct
+        }
+
         // 判「蓝牙可用」用的是宽松得多的窗口（60 秒），不是 RSSI 新鲜窗口（10 秒）。
         // 读不到读数不等于信号没了：iOS 后台会限流 readRSSI，拿 10 秒当断线
         // 会让定位反复启停，省下的电又全花回 GPS。
         let heldFresh = lastRssiAt > 0 && (now - lastRssiAt) < Logic.BLE_USABLE_HOLD_MS
         let bu = Logic.bleUsable(connected: ble.isConnected, rssiFresh: heldFresh,
                                  rssi: rssiSmooth, unlockThr: cfg.thr)
+        // 1.26：把「能开锁」和「能用」拆开。只有真正达到开锁门限才停定位，
+        // 否则 -78~-72 这段会变成黑洞：定位停了、开锁又不达标，人站在车门边干等。
+        let strong = Logic.bleStrong(connected: ble.isConnected, rssiFresh: rssiFresh,
+                                     rssi: rssiSmooth, unlockThr: cfg.thr)
 
-        if bu {
-            // ── 蓝牙有信号：人在车边，一个 GPS 点都不取 ──
+        if bu && strong {
+            // ── 贴着车：一个 GPS 点都不取 ──
             stopGeoForBle()
             return bleAct == Logic.UNLOCK ? Logic.UNLOCK : Logic.NONE
         }
 
-        // ── 蓝牙没信号：定位兜底 ──
-        startGeoForFar()
+        if bu && bleAct == Logic.UNLOCK {
+            // ── 信号不算强，但状态帧连着、RSSI 折算后达标：直接开，不必等定位 ──
+            stopGeoForBle()
+            return Logic.UNLOCK
+        }
+
+        // ── 弱连接（bu 但不够开锁）或已断开：交给定位 ──
+        // 弱连接时人在车边但信号被身体 / 口袋挡了，必须用精细档才可能过精度门槛；
+        // 完全断开才是「走远锁车」的场景，粗档足够而且省电。
+        if bu {
+            startGeoForNear()
+        } else {
+            startGeoForFar()
+        }
         let g = buildGeo(now, cfg, gcfg)
         let ok = Geo.usable(g, gcfg)
         if geoActive != ok { geoActive = ok }
@@ -4258,18 +4404,24 @@ final class AutoEngine: NSObject, ObservableObject {
 
         geoSt = g
 
-        if Logic.farLockReady(bleUsable: false, geoUsable: ok, dist: g.dist,
+        // 注意这里传 `bu` 而不是写死的 false：弱连接同样不许锁车 —— 人可能
+        // 就在车边打电话，只是信号被挡住了。1.25 那条分支只在 bu=false 时才会
+        // 走到，所以写死无碍；1.26 弱连接也会走到这里，写死就等于「信号一弱就锁」。
+        if Logic.farLockReady(bleUsable: bu, geoUsable: ok, dist: g.dist,
                               farM: farM, awayLong: awayLong) {
             return Logic.LOCK
         }
 
-        // 定位兜底开锁：蓝牙连不上，但人确实站在车边（车机蓝牙还没回连 / 抽风）。
-        // 精度卡 15 米、距离卡在门限内，两条都满足才认 —— 不能拿 ±50 米的点开锁。
+        // 定位兜底开锁：蓝牙连不上或信号太弱，但人确实站在车边。
+        // 1.26 把精度门槛从 15 米放到 `accNearM`（默认 30）：
+        // 原来「15 米」和粗档定位（精度 65 米+）根本不可能同时成立，
+        // 这条兜底等于从来没生效过 —— 也是罚站的一大来源。
         if ok, !g.dist.isNaN,
-           g.dist <= store.geoNearM, g.phoneAcc <= 15,
+           g.dist <= store.geoNearM, g.phoneAcc <= gcfg.accNearM,
            store.autoUnlock,
            armed, !st.moving, !st.unlockedThisVisit,
            (now - lastUnlockAt) > cfg.unlockCooldownMs {
+            log("◇ 定位兜底开锁：距车 \(Int(g.dist.rounded())) 米，精度 ±\(Int(g.phoneAcc)) 米")
             return Logic.UNLOCK
         }
 
@@ -4279,16 +4431,55 @@ final class AutoEngine: NSObject, ObservableObject {
     /// 蓝牙有信号时把定位停掉。**这是这一版省电的主要来源**：
     /// 原先定位一路常开，人在车旁一天几百次采点；现在只有在车机连不上时才有 GPS。
     private func stopGeoForBle() {
+        // 界面状态先清：即使定位本来就没跑（仅蓝牙模式），也要把「距车 xx 米」
+        // 这类上一轮的残留清掉，否则用户会拿一个不再更新的数当实时值。
+        if geoActive || !distText.isEmpty {
+            geoActive = false
+            // 距离必须跟着一起清掉：定位停了之后这个数不会再更新，
+            // 留着「距车 320 米」比留一个空格更糟。
+            distText = ""
+            lastDistM = -1
+            pushWidget(force: true)
+        }
         guard loc.running else { return }
         loc.stop()
-        geoActive = false
-        // 距离必须跟着一起清掉：定位停了之后这个数不会再更新，
-        // 留着「距车 320 米」比留一个空格更糟 —— 用户会拿它当实时值看。
-        if !distText.isEmpty { distText = "" }
-        lastDistM = -1
-        pushWidget(force: true)
-        log("· 蓝牙已连上 → 停掉定位（不再取 GPS 点）")
+        log("· 停掉定位（不再取 GPS 点）")
     }
+
+    /// 蓝牙连着但信号不够开锁（-78~-72）时，拉起**精细**定位。
+    ///
+    /// 这条分支是 1.26 补的。1.25 只分「可用 / 不可用」：可用就停定位，
+    /// 于是信号在这 6dB 区间时既不取 GPS、又开不了锁 —— 人贴着车门站着，
+    /// App 一声不响。用户口中的「罚站」多半就是这一段。
+    ///
+    /// 用精细档而不是粗档：粗档精度 65 米起步，`Geo.usable` 都过不了，
+    /// 更别说拿它判「10 米内」。这段通常只持续几秒到几十秒（人正走到车边），
+    /// 多花的电有限。
+    private func startGeoForNear() {
+        guard running, store.geoOn else { return }
+        if loc.running {
+            // setMode 内部会去重，档位没变不会重启定位
+            loc.setMode(.fine)
+            return
+        }
+        guard loc.authorized else {
+            if !geoAskedThisSession {
+                geoAskedThisSession = true
+                loc.askPermission()
+                log("⚠︎ 蓝牙信号偏弱、定位没授权 → 只能等信号变强再开锁")
+            }
+            locText = loc.statusText
+            return
+        }
+        loc.setBackground(store.locBg)
+        loc.setMode(.fine)
+        loc.start()
+        locText = loc.statusText
+        log("▶ 蓝牙信号偏弱（\(rssiSmooth)dBm，门限 \(cfgThr)）→ 精细定位兜底开锁")
+    }
+
+    /// 门限的简写，只给日志用
+    private var cfgThr: Int { return store.cfg.thr }
 
     /// 蓝牙没信号时才拉起定位，默认粗档。
     /// 判 100 米用不着 10 米精度，粗档（百米精度 + 100 米位移）耗电约细档的十分之一。
@@ -4448,6 +4639,13 @@ final class AutoEngine: NSObject, ObservableObject {
 
     /// 走网络，不需要蓝牙在附近。实车抓包：303120 启动、303125 熄火。
     private func engine(start: Bool) {
+        // 启动 / 熄火只有网络这一条路。仅蓝牙模式下拒绝，
+        // 而不是「偷偷发一条」—— 那正是用户选纯蓝牙时要避开的东西。
+        if store.chMode == Logic.MODE_BLE {
+            log("· 仅蓝牙模式：\(start ? "一键启动" : "熄火")只能走网络，已禁用")
+            lastResult = "仅蓝牙模式不支持\(start ? "启动" : "熄火")"
+            return
+        }
         guard !acting else {
             log("⚠︎ 上一条指令还在执行")
             return
@@ -4534,6 +4732,13 @@ final class AutoEngine: NSObject, ObservableObject {
 
     /// 纯网络按钮
     func netOnly(unlock: Bool) {
+        // 仅蓝牙模式：这是 UI 之外的第二道闸。按钮已经置灰，这里再挡一次，
+        // 免得将来改界面时又把「一条网络指令都不发」破了。
+        if store.chMode == Logic.MODE_BLE {
+            log("· 仅蓝牙模式：网络指令已禁用（要发请先切到「智能」或「仅网络」）")
+            lastResult = "仅蓝牙模式已禁用网络"
+            return
+        }
         log("▶ 网络\(unlock ? "开锁" : "锁车")")
         pendingUnlock = unlock
         pendingChannel = Logic.CH_NET
@@ -4569,16 +4774,17 @@ final class AutoEngine: NSObject, ObservableObject {
 
         let cfg = store.cfg
         let rssiAge: Int64 = lastRssiAt > 0 ? CarAPI.nowMs() - lastRssiAt : -1
-        // 1.25：删掉「定位可用就强制走网络」这条分支。
-        //
-        // 它把蓝牙彻底架空了 —— 只要定位在跑，每次开锁都绕到云端再回来：
-        // 本地 0.2 秒能做完的事要走 3~10 秒，还得排在别人后面。手机会卡、
-        // 耗电，一半原因在这里。现在两端口径统一：蓝牙够得着就走蓝牙。
-        let ch: Int = unlock
-            ? Logic.unlockChannel(hasTarget: ble.hasSavedTarget, connected: ble.isConnected,
-                                  rssiAgeMs: rssiAge, rssi: lastRssiValue, cfg)
-            : Logic.lockChannel(hasTarget: ble.hasSavedTarget, connected: ble.isConnected,
-                                rssiAgeMs: rssiAge, rssi: lastRssiValue, cfg)
+        // 1.26：通道由「指令通道模式」说了算。
+        // 仅蓝牙 → 绝不偷偷走网络；仅网络 → 蓝牙只读状态，不下发。
+        // 智能模式仍是老规矩：蓝牙够得着就走蓝牙，本地 0.2 秒完成。
+        let mode = store.chMode
+        let ch: Int = Logic.pickCh(mode,
+                                   unlock: unlock,
+                                   hasTarget: ble.hasSavedTarget,
+                                   connected: ble.isConnected,
+                                   rssiAgeMs: rssiAge,
+                                   rssi: lastRssiValue,
+                                   cfg)
 
         // 信号值只在「还在有效期内」时才有意义：-127 是没读到的哨兵值，
         // 67 秒前的 -90dBm 也不代表现在离车多远，直接打出来只会误导。
@@ -4590,7 +4796,10 @@ final class AutoEngine: NSObject, ObservableObject {
         } else {
             sigText = "\(lastRssiValue)dBm（\(rssiAge / 1000)s 前）"
         }
-        log("通道选择：\(Logic.channelName(ch))（\(sigText)）")
+        log("通道选择：\(Logic.channelName(ch)) · \(Logic.modeName(mode))模式（\(sigText)）")
+        if ch == Logic.CH_NET && !signedIn {
+            log("⚠︎ 当前未登录网络，网络通道可能被拒")
+        }
         pendingUnlock = unlock
         pendingChannel = ch
         acting = true
@@ -4621,6 +4830,9 @@ final class AutoEngine: NSObject, ObservableObject {
     ///
     /// - Returns: true 表示已按竞速发出，调用方不要再走单通道逻辑
     private func tryRace(unlock: Bool, auto: Bool, manual: Bool) -> Bool {
+        // 仅蓝牙 / 仅网络是明确的单通道选择，不参与竞速 —— 由 requestAction
+        // 的单通道路径下发。否则「仅蓝牙」点一下，网络那条还是会偷偷发出去。
+        guard Logic.modeAllowsRace(store.chMode) else { return false }
         // 自动触发一律走双通道：用户明确要求「靠近就蓝牙和网络一起发，谁先回算谁」。
         // 手动按钮仍尊重界面上的「双通道竞速」开关 —— 有人就是想省点流量。
         guard auto || store.raceOn, !raceActive, !ble.busy else { return false }
@@ -4788,8 +5000,16 @@ final class AutoEngine: NSObject, ObservableObject {
             lastResult = "锁车成功（\(Logic.channelName(ch))）"
         }
         statsText = Stats.summary()
+        // 9 秒后回查一次，确认车机真的锁上了。
+        // 1.27：仅蓝牙模式跳过 —— 这一步是最容易被忽略的「偷偷联网」，
+        // 锁车本身走本地蓝牙，用户以为一条请求都没发，其实这里补了一条。
         DispatchQueue.main.asyncAfter(deadline: .now() + 9) { [weak self] in
-            self?.refreshStatus()
+            guard let self = self else { return }
+            guard self.store.chMode != Logic.MODE_BLE else {
+                self.log("· 仅蓝牙模式：跳过锁车后的状态回查")
+                return
+            }
+            self.refreshStatus()
         }
     }
 
@@ -4825,6 +5045,27 @@ final class AutoEngine: NSObject, ObservableObject {
         store.raceOn = on
         raceEnabled = on
         log(on ? "双通道竞速：已开启" : "双通道竞速：已关闭（回到单通道优先逻辑）")
+    }
+
+    /// 切换指令通道模式（1.26）。
+    ///
+    /// 改完立刻重判一次：用户在车边发现「纯蓝牙更稳」时切过去，应该下一秒就生效，
+    /// 而不是等他走开再回来。切到「仅蓝牙」时顺便把正在跑的定位停掉 ——
+    /// 定位的用途只有「网络兜底 / 走远锁车」，纯蓝牙模式下它只会白耗电。
+    func setChMode(_ m: Int) {
+        let v = (m == Logic.MODE_BLE || m == Logic.MODE_NET) ? m : Logic.MODE_SMART
+        store.chMode = v
+        chMode = v
+        switch v {
+        case Logic.MODE_BLE:
+            log("指令通道：仅蓝牙（不再发送任何网络指令）")
+            stopGeoForBle()
+        case Logic.MODE_NET:
+            log("指令通道：仅网络（蓝牙只读车锁与门位状态）")
+        default:
+            log("指令通道：智能（蓝牙优先，够不着转网络）")
+        }
+        if running { evaluate("通道模式切换") }
     }
 
     func setDoorGuard(_ on: Bool) {
@@ -5151,7 +5392,9 @@ final class AutoEngine: NSObject, ObservableObject {
         // 网络指令等确认期间，蓝牙通常已经断了，一帧状态都收不到 —— 只能主动查。
         // 8 秒一次：车机 3 秒一帧，云端查询来回 1~2 秒，再密就是白烧流量。
         // 用 lastPollAt 兜住，refreshStatus 内部再调回 checkVerify 也不会成环。
-        if netPendAt > 0, now - lastPollAt > 8000 {
+        //
+        // 仅蓝牙模式跳过：核实要靠车机状态帧，用户要的就是一条网络请求都不发。
+        if store.chMode != Logic.MODE_BLE, netPendAt > 0, now - lastPollAt > 8000 {
             lastPollAt = now
             refreshStatus()
         }
@@ -5164,6 +5407,12 @@ final class AutoEngine: NSObject, ObservableObject {
     ///   调用方不要清掉待核实标记，下一拍再试。
     @discardableResult
     private func dispatchFallback(unlock: Bool) -> Bool {
+        // 仅蓝牙模式：蓝牙失败就是失败，不许偷偷转网络。
+        // 用户选这个模式要的就是「一条网络指令都不发」。
+        if store.chMode == Logic.MODE_BLE {
+            log("· 仅蓝牙模式：不转网络，这一笔放弃")
+            return false
+        }
         guard !acting else { return false }
         pendingUnlock = unlock
         pendingChannel = Logic.CH_NET
@@ -5221,7 +5470,9 @@ final class AutoEngine: NSObject, ObservableObject {
         let now = CarAPI.nowMs()
         let bleFresh = ble.lastSeenMs > 0 && (now - ble.lastSeenMs) < store.cfg.freshMs
         let gap = Power.statusMinGapMs(bleFresh: bleFresh)
-        if lastPollAt == 0 || now - lastPollAt >= gap {
+        if store.chMode == Logic.MODE_BLE {
+            log("· 仅蓝牙模式：跳过网络状态查询")
+        } else if lastPollAt == 0 || now - lastPollAt >= gap {
             lastPollAt = now
             refreshStatus()
         } else {
@@ -5442,10 +5693,13 @@ extension AutoEngine: BleCentralDelegate {
         } else {
             rssiSmooth = (rssiSmooth * 3 + r) / 4
         }
-        // 前台时才靠 RSSI 补判「走近了」；后台这个回调本来就不稳，
-        // 真正的主力是 bleConnected(true) 那一次判定。
-        guard running, UIApplication.shared.applicationState == .active else { return }
-        if rssiSmooth >= store.cfg.thr && armed && !st.unlockedThisVisit {
+        // 1.26：门槛放到「开锁门限 - 6dB」，并且后台也判。
+        //
+        // 原来卡在 `>= thr`，且后台直接 return。结果：口袋挡住信号掉到 -75 时，
+        // 这个回调连判定都不触发，人走到车门边 App 一无所知 —— 这是罚站的另一半。
+        // 后台回调频率低，但有一次算一次，正是「锁屏揣兜里走过去」的现场。
+        guard running else { return }
+        if rssiSmooth >= store.cfg.thr - Logic.BLE_REACH_SLACK_DB, armed, !st.unlockedThisVisit {
             evaluate("信号转强")
         }
     }
@@ -5532,10 +5786,13 @@ extension AutoEngine: BleCentralDelegate {
             // 熄火下车关门，车辆自己上锁 → 绝不能下一拍又把它解开。
             // 1.22 起不再要求「此刻判近」：手机落在车里、蓝牙刚断过，都会让判近失败，
             // 而「车从没锁变已锁」本身就说明刚才有人在车边动过它。
-            // 正常开锁不受影响：走开 30 秒后这个标记会被重置，下次走近照常开。
+            //
+            // 1.26：记下翻转时刻。若人持续在车旁 20 秒（`Logic.decide` 里判），
+            // 就解除抑制 —— 否则下车拿个东西就再也拉不开门，这是最常见的罚站现场。
             st.unlockedThisVisit = true
+            st.flipAt = CarAPI.nowMs()
             geoSt.unlockedThisVisit = true
-            log("车辆刚上锁（人还在车旁或手机落在车里）→ 本次到访不再自动开锁；走开再回来才恢复")
+            log("车辆刚上锁（人还在车旁或手机落在车里）→ 20 秒内不自动开；持续在车旁会自动解除")
         }
         // 锁车状态变了必须立刻让小组件知道；没变就走节流，别每 3 秒推一次
         pushWidget(force: !wasKnown || wasArmed != a)
@@ -5558,7 +5815,11 @@ extension AutoEngine: BleCentralDelegate {
             }
         } else {
             if wasActing && pendingChannel == Logic.CH_BLE {
-                if fallbackRound < 1 {
+                if store.chMode == Logic.MODE_BLE {
+                    log("✗ 蓝牙失败（\(msg)）· 仅蓝牙模式：不转网络，这一笔放弃")
+                    lastResult = msg
+                    if !pendingUnlock { noteLockFailed(msg) }
+                } else if fallbackRound < 1 {
                     fallbackRound += 1
                     log("蓝牙失败（\(msg)），自动转网络")
                     pendingChannel = Logic.CH_NET
@@ -5676,20 +5937,24 @@ struct BigButton: View {
 struct GhostButton: View {
     let title: String
     let color: Color
+    /// false 时置灰不可点。1.27：仅蓝牙模式下必须把网络按钮一起关掉，
+    /// 否则「一条网络指令都不发」和底部这两个按钮自相矛盾。
+    var enabled: Bool = true
     let action: () -> Void
 
     var body: some View {
         Button(action: action) {
             Text(title)
                 .font(.system(size: 14, weight: .semibold))
-                .foregroundColor(color)
+                .foregroundColor(enabled ? color : UI.dim.opacity(0.45))
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 12)
                 .background(
                     RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .stroke(color.opacity(0.55), lineWidth: 1.2)
+                        .stroke(enabled ? color.opacity(0.55) : UI.line, lineWidth: 1.2)
                 )
         }
+        .disabled(!enabled)
     }
 }
 
@@ -6222,33 +6487,39 @@ struct MainView: View {
     private var actionCard: some View {
         VStack(spacing: 10) {
             HStack(spacing: 10) {
-                BigButton(title: "开锁", subtitle: "双通道竞速", color: UI.accent) {
+                BigButton(title: "开锁", subtitle: Logic.modeName(e.chMode), color: UI.accent) {
                     e.manual(unlock: true)
                 }
-                BigButton(title: "锁车", subtitle: "双通道竞速", color: UI.warn) {
+                BigButton(title: "锁车", subtitle: Logic.modeName(e.chMode), color: UI.warn) {
                     e.manual(unlock: false)
                 }
             }
+            // 1.27：仅蓝牙模式下这四个按钮一起置灰。
+            // 它们全是纯网络指令，留着可点就等于「纯蓝牙」名不副实。
             HStack(spacing: 10) {
-                GhostButton(title: "网络开锁", color: UI.accent) {
+                GhostButton(title: "网络开锁", color: UI.accent,
+                            enabled: e.chMode != Logic.MODE_BLE) {
                     e.netOnly(unlock: true)
                 }
-                GhostButton(title: "网络锁车", color: UI.warn) {
+                GhostButton(title: "网络锁车", color: UI.warn,
+                            enabled: e.chMode != Logic.MODE_BLE) {
                     e.netOnly(unlock: false)
                 }
             }
             HStack(spacing: 10) {
-                GhostButton(title: "一键启动", color: UI.ok) {
+                GhostButton(title: "一键启动", color: UI.ok,
+                            enabled: e.chMode != Logic.MODE_BLE) {
                     engineStart = true
                     showEngine = true
                 }
-                GhostButton(title: "熄火", color: UI.dim) {
+                GhostButton(title: "熄火", color: UI.dim,
+                            enabled: e.chMode != Logic.MODE_BLE) {
                     engineStart = false
                     showEngine = true
                 }
             }
-            Text("默认蓝牙优先：够得着就别走网络，本地 0.2 秒完成。"
-                + "最后的两个按钮走网络，人在车外也能用。")
+            Text("通道按上面「指令通道」的设置走：智能＝蓝牙优先、够不着转网络；"
+                + "仅蓝牙＝不发任何网络指令（这四个网络按钮会变灰）；仅网络＝全走云端。")
                 .font(.system(size: 11))
                 .foregroundColor(UI.dim)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -6279,7 +6550,7 @@ struct MainView: View {
                         Text("走远自动锁车")
                             .font(.system(size: 15, weight: .semibold))
                             .foregroundColor(UI.text)
-                        Text("蓝牙没信号时才用定位：\(Int(Logic.farLockM(Store.shared.geoFarM))) 米外锁车，\(Int(Store.shared.geoNearM)) 米内兜底开锁。蓝牙连着时完全不取 GPS。")
+                        Text("蓝牙没信号、或信号弱到开不了锁时才用定位：\(Int(Logic.farLockM(Store.shared.geoFarM))) 米外锁车，\(Int(Store.shared.geoNearM)) 米内兜底开锁。信号够强时完全不取 GPS。")
                             .font(.system(size: 11))
                             .foregroundColor(UI.dim)
                             .fixedSize(horizontal: false, vertical: true)
@@ -6367,9 +6638,39 @@ struct MainView: View {
 
                 Divider().background(UI.line)
 
-                toggleRow("双通道竞速",
-                          "开锁 / 锁车时蓝牙与网络同时下发，谁先回执算谁。两条都是幂等指令，不会多锁一次。",
-                          isOn: Binding(get: { e.raceEnabled }, set: { e.setRace($0) }))
+                // 指令通道（1.26）：用户要的「纯蓝牙 / 自由选择 / 一起共用」。
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("指令通道")
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundColor(UI.text)
+                        Spacer()
+                        Text(Logic.modeName(e.chMode))
+                            .font(.system(size: 11))
+                            .foregroundColor(UI.accent)
+                    }
+
+                    Picker("", selection: Binding(
+                        get: { e.chMode },
+                        set: { e.setChMode($0) }
+                    )) {
+                        Text("智能").tag(Logic.MODE_SMART)
+                        Text("仅蓝牙").tag(Logic.MODE_BLE)
+                        Text("仅网络").tag(Logic.MODE_NET)
+                    }
+                    .pickerStyle(SegmentedPickerStyle())
+
+                    Text(modeHint(e.chMode))
+                        .font(.system(size: 10))
+                        .foregroundColor(UI.dim)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                if e.chMode == Logic.MODE_SMART {
+                    toggleRow("双通道竞速",
+                              "开锁 / 锁车时蓝牙与网络同时下发，谁先回执算谁。两条都是幂等指令，不会多锁一次。",
+                              isOn: Binding(get: { e.raceEnabled }, set: { e.setRace($0) }))
+                }
 
                 toggleRow("离车较远时降低定位精度",
                           "300 米外降到粗略定位，回到车附近自动升到 GPS 高频。精度只在需要时花钱。",
@@ -6386,8 +6687,21 @@ struct MainView: View {
         }
     }
 
-    private func toggleRow(_ title: String, _ hint: String, isOn: Binding<Bool>) -> some View {
-        HStack(alignment: .center) {
+    /// 通道模式的说明。三句话分别回答：为什么这样选、代价是什么。
+    private func modeHint(_ m: Int) -> String {
+        switch m {
+        case Logic.MODE_BLE:
+            return "一条网络指令都不发：最省流量，也不受云端抖动影响。代价是蓝牙连不上时这一笔就放弃，"
+                + "走远锁车退回「断开够久」。"
+        case Logic.MODE_NET:
+            return "指令全走云端，人在车外也能用，但通常要 3~10 秒。蓝牙仍然连着 —— "
+                + "车锁和门位只能从车机状态帧读，断了就没有判定依据。"
+        default:
+            return "蓝牙优先：够得着就本地下发（0.2 秒），够不着自动转网络；两条都够时并发，谁先回算谁。"
+        }
+    }
+
+    private func toggleRow(_ title: String, _ hint: String, isOn: Binding<Bool>) -> some View {        HStack(alignment: .center) {
             VStack(alignment: .leading, spacing: 3) {
                 Text(title)
                     .font(.system(size: 14, weight: .medium))
@@ -6470,7 +6784,7 @@ struct MainView: View {
                           value: $geoNear,
                           range: 5 ... 30,
                           step: 1,
-                          hint: "只在「蓝牙连不上、但人确实站在车边」时用：定位距离小于它、且精度优于 15 米，才兜底开一次锁。蓝牙正常时完全不看这一项。")
+                          hint: "只在「蓝牙连不上或信号偏弱、但人确实站在车边」时用：定位距离小于它、且精度优于 30 米，才兜底开一次锁。蓝牙正常时完全不看这一项。")
 
                 SliderRow(title: "开锁信号门限",
                           unit: " dBm",
