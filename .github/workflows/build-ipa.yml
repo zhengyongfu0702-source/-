@@ -10,11 +10,83 @@ on:
 jobs:
   build:
     runs-on: macos-15
-    timeout-minutes: 25
+    timeout-minutes: 30
 
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
+
+      # ──────────────────────────────────────────────────────────────
+      # 图标是「装到手机上才看得见」的东西，也是最容易翻车的地方：
+      # 手传 9 个 png 时，只要漏一个、或者文件名和 Contents.json 里写的
+      # 对不上，actool 只报一条 warning，构建照样变绿，装上去却是白块。
+      # 光看日志根本发现不了。
+      #
+      # 所以改成：仓库里只放一张 1024 原图（SXKC/icon-1024.png），
+      # 编译前用它现场生成整套尺寸 + 现场写 Contents.json。
+      # 「漏传一个」「名字对不上」这两类错就都不存在了。
+      #
+      # 那张原图本身不在 sources 清单里，不会被编译，只是给这一步当原料。
+      # ──────────────────────────────────────────────────────────────
+      - name: 生成图标资源
+        run: |
+          SRC="SXKC/icon-1024.png"
+          DIR="SXKC/Assets.xcassets/AppIcon.appiconset"
+
+          if [ ! -f "$SRC" ]; then
+            echo "::error::找不到图标原图 $SRC —— SXKC 目录下要有 icon-1024.png"
+            ls -la SXKC | head -20 || true
+            exit 1
+          fi
+
+          # 旧目录整个删掉重来：里面可能是上一次上传留下的半套图，
+          # 或者是一份和实际文件对不上的 Contents.json。
+          rm -rf "$DIR"
+          mkdir -p "$DIR"
+
+          # iOS 需要的尺寸。120 出现两次是正常的：40pt@3x 和 60pt@2x 同为 120px。
+          for s in 40 58 60 80 87 120 180; do
+            sips -z $s $s "$SRC" --out "$DIR/icon-$s.png" >/dev/null
+          done
+          cp "$SRC" "$DIR/icon-1024.png"
+
+          # 用 printf 逐行写，不用 heredoc —— 避免 YAML 的缩进混进 JSON
+          printf '%s\n' \
+            '{' \
+            '  "images": [' \
+            '    { "filename": "icon-40.png",   "idiom": "iphone", "scale": "2x", "size": "20x20" },' \
+            '    { "filename": "icon-60.png",   "idiom": "iphone", "scale": "3x", "size": "20x20" },' \
+            '    { "filename": "icon-58.png",   "idiom": "iphone", "scale": "2x", "size": "29x29" },' \
+            '    { "filename": "icon-87.png",   "idiom": "iphone", "scale": "3x", "size": "29x29" },' \
+            '    { "filename": "icon-80.png",   "idiom": "iphone", "scale": "2x", "size": "40x40" },' \
+            '    { "filename": "icon-120.png",  "idiom": "iphone", "scale": "3x", "size": "40x40" },' \
+            '    { "filename": "icon-120.png",  "idiom": "iphone", "scale": "2x", "size": "60x60" },' \
+            '    { "filename": "icon-180.png",  "idiom": "iphone", "scale": "3x", "size": "60x60" },' \
+            '    { "filename": "icon-1024.png", "idiom": "ios-marketing", "scale": "1x", "size": "1024x1024" }' \
+            '  ],' \
+            '  "info": { "author": "xcode", "version": 1 }' \
+            '}' > "$DIR/Contents.json"
+
+          echo "==== 生成的图标 ===="
+          ls -l "$DIR"
+          echo "==== Contents.json ===="
+          cat "$DIR/Contents.json"
+
+          # 每一张都得有实际内容。掉一张，某个尺寸下就是白块。
+          n=0
+          for f in "$DIR"/*.png; do
+            sz=$(wc -c < "$f" | tr -d ' ')
+            if [ "$sz" -lt 300 ]; then
+              echo "::error::$f 只有 $sz 字节，这张图没生成成功"
+              exit 1
+            fi
+            n=$((n+1))
+          done
+          if [ "$n" -ne 8 ]; then
+            echo "::error::只生成了 $n 张图，应该是 8 张"
+            exit 1
+          fi
+          echo "图标生成完毕：$n 张 + Contents.json"
 
       - name: 显示 Xcode 版本
         run: xcodebuild -version
@@ -36,13 +108,99 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
-            CODE_SIGN_ENTITLEMENTS="" \
             build
+
+      # 未签名构建不会把 entitlements 打进 .app，而小组件读主 App 的数据
+      # 完全依赖 App Group —— 没有它，小组件永远是「状态未知」。
+      # 所以这里手动把权限文件写进 .app 和 .appex，TrollStore 安装时
+      # 会用包内的 entitlements.plist 做 ldid 伪签名。
+      - name: 注入 App Group 权限
+        run: |
+          APP="build/Build/Products/Release-iphoneos/SXKC.app"
+          EXT="$APP/PlugIns/SXKCWidget.appex"
+
+          echo "==== 包结构 ===="
+          ls -la "$APP"
+          echo "---- PlugIns ----"
+          ls -la "$APP/PlugIns" || true
+
+          if [ ! -d "$EXT" ]; then
+            echo "::error::没找到小组件扩展 $EXT —— 扩展没被嵌进 PlugIns"
+            find "$APP" -maxdepth 3 | head -60
+            exit 1
+          fi
+
+          # 用 printf 逐行写，避免 heredoc 把 YAML 的缩进一起写进 XML
+          # （<?xml 前面不能有空格，否则 plist 直接解析失败）
+          mkplist() {
+            printf '%s\n' \
+              '<?xml version="1.0" encoding="UTF-8"?>' \
+              '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+              '<plist version="1.0">' \
+              '<dict>' \
+              '  <key>application-identifier</key>' \
+              "  <string>$1</string>" \
+              '  <key>com.apple.security.application-groups</key>' \
+              '  <array>' \
+              '    <string>group.cn.sxkc.lite</string>' \
+              '  </array>' \
+              '</dict>' \
+              '</plist>' > "$2"
+          }
+
+          mkplist cn.sxkc.lite "$APP/entitlements.plist"
+          mkplist cn.sxkc.lite.widget "$EXT/entitlements.plist"
+
+          echo "==== 主 App 权限 ===="
+          /usr/libexec/PlistBuddy -c "Print" "$APP/entitlements.plist"
+          echo "==== 扩展 Info.plist 的 NSExtension ===="
+          /usr/libexec/PlistBuddy -c "Print :NSExtension" "$EXT/Info.plist"
+
+      # 把和图标有关的三件事都摊开印在日志里：
+      # 资源有没有编出 Assets.car、Info.plist 有没有指到它、显示名和版本对不对。
+      - name: 检查图标与显示名称
+        run: |
+          APP="build/Build/Products/Release-iphoneos/SXKC.app"
+
+          echo "==== 显示名称 ===="
+          /usr/libexec/PlistBuddy -c "Print :CFBundleDisplayName" "$APP/Info.plist"
+          echo "==== 版本 ===="
+          /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$APP/Info.plist"
+
+          echo "==== Assets.car ===="
+          if [ -f "$APP/Assets.car" ]; then
+            ls -lh "$APP/Assets.car"
+            # 图标编进去了的话，car 文件里一定带 AppIcon 这个名字
+            if command -v assetutil >/dev/null 2>&1; then
+              assetutil --info "$APP/Assets.car" | grep -i '"Name" : "AppIcon' | head -5 || true
+            fi
+          else
+            echo "::error::没有 Assets.car —— 图标资源没编进包，桌面会显示白块"
+            ls -la "$APP"
+            exit 1
+          fi
+
+          echo "==== CFBundleIconName / CFBundleIcons ===="
+          if /usr/libexec/PlistBuddy -c "Print :CFBundleIconName" "$APP/Info.plist" >/dev/null 2>&1; then
+            /usr/libexec/PlistBuddy -c "Print :CFBundleIconName" "$APP/Info.plist"
+          else
+            # 正常情况下 actool 会把这个键写进 Info.plist。
+            # 没写进去时 iOS 有可能找不到图标，这里补一刀 —— 值是资源名，
+            # 只要 Assets.car 里有 AppIcon 就对得上，不会造成副作用。
+            echo "Info.plist 里没有 CFBundleIconName，补上 AppIcon"
+            /usr/libexec/PlistBuddy -c "Add :CFBundleIconName string AppIcon" "$APP/Info.plist"
+            /usr/libexec/PlistBuddy -c "Print :CFBundleIconName" "$APP/Info.plist"
+          fi
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIcons" "$APP/Info.plist" || true
+
+          echo "==== app 里的图标相关文件 ===="
+          ls -la "$APP" | grep -iE 'assets|icon|\.car' || echo "（没有单独的图标文件，正常：全部在 Assets.car 里）"
 
       - name: 打包成 ipa
         run: |
           APP="build/Build/Products/Release-iphoneos/SXKC.app"
-          ls -la "$APP"
+          ls -la "$APP" "$APP/PlugIns"
           rm -rf Payload
           mkdir -p Payload
           cp -R "$APP" Payload/
