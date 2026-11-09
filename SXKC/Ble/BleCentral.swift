@@ -6,6 +6,8 @@ protocol BleCentralDelegate: AnyObject {
     func bleLink(_ b: BleCentral, _ s: String)
     func bleRssi(_ b: BleCentral, _ rssi: Int)
     func bleArmed(_ b: BleCentral, _ armed: Bool)
+    /// 状态帧原始 16 字节。门位（body[3]）从这里取
+    func bleStatusBody(_ b: BleCentral, _ body: [UInt8])
     func bleDone(_ b: BleCentral, ok: Bool, msg: String)
     func bleConnected(_ b: BleCentral, _ connected: Bool)
     /// 诊断页：扫描到设备
@@ -19,6 +21,7 @@ extension BleCentralDelegate {
     func bleLink(_ b: BleCentral, _ s: String) {}
     func bleRssi(_ b: BleCentral, _ rssi: Int) {}
     func bleArmed(_ b: BleCentral, _ armed: Bool) {}
+    func bleStatusBody(_ b: BleCentral, _ body: [UInt8]) {}
     func bleDone(_ b: BleCentral, ok: Bool, msg: String) {}
     func bleConnected(_ b: BleCentral, _ connected: Bool) {}
     func bleDiscovered(_ b: BleCentral, _ p: CBPeripheral, rssi: Int, adv: [String: Any]) {}
@@ -100,6 +103,8 @@ final class BleCentral: NSObject {
     /// 只靠被动收状态帧不够稳，主动 readRSSI 既保活又顺手更新距离。
     private var pingTimer: Timer?
     private var lastStatusFlags = ""
+    /// 上一次的门位字节，用来判断门开关是否变化（日志只在变化时记一行）
+    private var lastDoorByte: UInt8 = 0xFF
 
     private var sawAnyDevice = false
     private(set) var diagMode = false
@@ -276,6 +281,7 @@ final class BleCentral: NSObject {
         lastRssiAt = 0
         lastAttemptAt = 0
         lastStatusFlags = ""
+        lastDoorByte = 0xFF
         lastLoggedMissing = ""
         log("已清空蓝牙会话（车机记录保留）")
     }
@@ -559,16 +565,18 @@ final class BleCentral: NSObject {
             }
         } else if type == Frame.TYPE_STATUS {
             let armed = Frame.armedOfStatusBody(b)
-            // 状态帧只在 flags 字节变化时记一行，且把整帧明文带上 ——
+            // 状态帧只在 flags 或门位变化时记一行，且把整帧明文带上 ——
             // 之前只记 armed 的布尔值，01/11/21 之间的来回跳完全看不出来。
             let fl = Frame.statusFlags(b)
-            // 事件帧（body[3]!=0）即使 flags 没变也要记 —— 门位大概率就藏在这类帧里
-            let event = Frame.isEventBody(b)
-            if lastStatusFlags != fl || event {
+            let doorByte: UInt8 = b.count > 3 ? b[3] : 0
+            if lastStatusFlags != fl || lastDoorByte != doorByte {
                 lastStatusFlags = fl
-                log((event ? "· 事件帧 " : "状态帧 ") + "flags=\(fl) \(armed ? "已锁" : "未锁") body=\(Hex.of(b))")
+                lastDoorByte = doorByte
+                let doorTxt = Frame.anyDoorOpen(b) ? "有门开着" : "四门全关"
+                log("状态帧 flags=\(fl) \(armed ? "已锁" : "未锁") 门位=\(doorTxt) body=\(Hex.of(b))")
             }
             delegate?.bleArmed(self, armed)
+            delegate?.bleStatusBody(self, b)
             if busy && !done && armed == !wantUnlock {
                 succeed(wantUnlock ? "已解锁" : "已锁车")
             }
