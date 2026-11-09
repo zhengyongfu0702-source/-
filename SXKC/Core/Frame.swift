@@ -96,14 +96,20 @@ enum Frame {
         return String(format: "%02X", body[5])
     }
 
-    /// 这一帧是不是「事件帧」而不是「周期帧」。
+    /// 是否有车门开着。
     ///
-    /// 实车日志里绝大多数状态帧的 body[3] 是 0x00（3 秒一帧的心跳），
-    /// 但开锁后 10 秒、长时间停放后各出现过一次 body[3]=0x0F，其余字节结构也不同。
-    /// 这很可能就是车门 / 遥控事件的入口 —— 门位大概率藏在这类帧里。
+    /// 门位在 `body[3]` 的低 4 位，来自原版 `UtilsField.parseVstStatus`：
+    /// `dor_lf=0x08 / dor_lb=0x02 / dor_rf=0x04 / dor_rb=0x01`。
     ///
-    /// 现在只做识别与记录（整帧 hex 进日志），不动任何动作。
-    static func isEventBody(_ body: [UInt8]) -> Bool {
-        return body.count > 3 && body[3] != 0x00
+    /// **但这台车机不区分具体是哪扇门**：实测开任意一扇门，原版 App 的车模上
+    /// 四个门全部显示"已打开"，帧里就是 `0x0F`；四门全关时是 `0x00`。
+    /// 所以这里只做布尔判断，不去解析单独某扇门 —— 解析了也是假的。
+    static func anyDoorOpen(_ body: [UInt8]) -> Bool {
+        return body.count > 3 && (body[3] & 0x0F) != 0
+    }
+
+    /// 尾箱位：`body[3]` 的 bit4（原版 `trunk` 用的就是这个掩码）
+    static func trunkOpen(_ body: [UInt8]) -> Bool {
+        return body.count > 3 && (body[3] & 0x10) != 0
     }
 }

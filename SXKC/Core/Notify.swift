@@ -20,6 +20,8 @@ final class Notify: NSObject {
     static let actionManualLock = "SXKC_MANUAL_LOCK"
     /// 通知分类：带「手动锁车」按钮
     static let catLockFailed = "SXKC_LOCK_FAILED"
+    /// 通知分类：门没关好所以没锁车，带「仍然锁车」按钮
+    static let catDoorOpen = "SXKC_DOOR_OPEN"
 
     private var asked = false
 
@@ -37,7 +39,14 @@ final class Notify: NSObject {
                                          actions: [lock],
                                          intentIdentifiers: [],
                                          options: [])
-        center.setNotificationCategories([cat])
+        let still = UNNotificationAction(identifier: Notify.actionManualLock,
+                                         title: "仍然锁车",
+                                         options: [.foreground])
+        let cat2 = UNNotificationCategory(identifier: Notify.catDoorOpen,
+                                          actions: [still],
+                                          intentIdentifiers: [],
+                                          options: [])
+        center.setNotificationCategories([cat, cat2])
 
         if asked { return }
         asked = true
@@ -75,6 +84,38 @@ final class Notify: NSObject {
         c.categoryIdentifier = Notify.catLockFailed
         post(id: "sxkc.auto.lockfailed", content: c)
         return true
+    }
+
+    /// 门没关好，所以这次没有下发锁车指令。
+    ///
+    /// 和「锁车失败」并列但性质不同：失败是发了指令车没应，
+    /// 这里是**我们主动没发**，因为门开着锁了也不算数。
+    /// 通知上给「仍然锁车」：有时候人就是想先把车锁上再去关门，不能被判断卡住。
+    @discardableResult
+    func doorBlocked(doorOpen: Bool, trunk: Bool) -> Bool {
+        let what: String
+        if doorOpen && trunk {
+            what = "车门和尾箱都没关好"
+        } else if trunk {
+            what = "尾箱没关好"
+        } else {
+            what = "有车门没关好"
+        }
+        let c = UNMutableNotificationContent()
+        c.title = "\(what)，没有自动锁车"
+        c.body = "门开着锁了也等于没锁。关好门会自动补锁；想现在就锁，点「仍然锁车」。"
+        c.sound = .default
+        c.categoryIdentifier = Notify.catDoorOpen
+        post(id: "sxkc.auto.dooropen", content: c)
+        return true
+    }
+
+    /// 门关好了就把那条「没锁车」撤掉，否则会一直挂在通知中心里
+    func clearDoorBlocked() {
+        UNUserNotificationCenter.current()
+            .removeDeliveredNotifications(withIdentifiers: ["sxkc.auto.dooropen"])
+        UNUserNotificationCenter.current()
+            .removePendingNotificationRequests(withIdentifiers: ["sxkc.auto.dooropen"])
     }
 
     /// 锁上之后把失败通知撤掉，免得留在通知中心误导
