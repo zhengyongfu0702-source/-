@@ -331,6 +331,10 @@ struct MainView: View {
                 toggleRow("通知与震动",
                           "自动锁车发一条带距离的通知，开锁轻震一下；连续 3 次锁不上会发强提醒。",
                           isOn: Binding(get: { e.notifyEnabled }, set: { e.setNotify($0) }))
+
+                toggleRow("门没关好不锁车",
+                          "车机会报门位。有门开着就不下发锁车指令，关好后自动补锁，并弹一条可「仍然锁车」的提醒。",
+                          isOn: Binding(get: { e.doorGuardEnabled }, set: { e.setDoorGuard($0) }))
             }
         }
     }
