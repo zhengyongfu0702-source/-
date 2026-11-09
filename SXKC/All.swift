@@ -279,10 +279,9 @@ enum Frame {
         return body.count > 3 && (body[3] & 0x0F) != 0
     }
 
-    /// 尾箱位：`body[3]` 的 bit4（原版 `trunk` 用的就是这个掩码）
-    static func trunkOpen(_ body: [UInt8]) -> Bool {
-        return body.count > 3 && (body[3] & 0x10) != 0
-    }
+    // 1.22 起不再解析尾箱（body[3] bit4）：那个掩码是从原版二进制里抄来的，
+    // 但三份实车日志里从没出现过它单独置位。留着它的风险是——万一这个位另有含义，
+    // 就会永久拦住锁车（车整夜不锁），比漏判尾箱严重得多。
 }
 
 
@@ -327,6 +326,10 @@ enum Geo {
 
         /// 连续多少拍方向一致才动作
         var confirmTicks = 2
+        /// 判「近」要连续保持多久（毫秒）才算数。
+        /// 原来用「两拍」，可拍数在 iOS 上是跟着系统定位回调走的（可能 1 秒也可能几分钟），
+        /// 换成时间之后语义才稳定。
+        var confirmHoldMs: Int64 = 15_000
         var unlockCooldownMs: Int64 = 60_000
         var lockCooldownMs: Int64 = 60_000
         /// 离开多久之后重置「本次到访已开过锁」，下次走近才能再开
@@ -394,6 +397,9 @@ enum Geo {
         var farSince: Int64 = 0
         /// 最近一次判定在近处的时刻
         var lastNearAt: Int64 = 0
+        /// 这一轮「判近」从什么时候开始连续成立；0 = 当前没在近处。
+        /// 用它算「持续了多久」，替代原来按拍数确认的做法。
+        var nearSince: Int64 = 0
     }
 
     // MARK: 几何
@@ -453,6 +459,7 @@ enum Geo {
 
         if near {
             s.nearTicks += 1
+            if s.nearSince == 0 { s.nearSince = s.now }
             s.farTicks = 0
             s.farSince = 0
             s.visited = true
@@ -460,36 +467,42 @@ enum Geo {
         } else if far {
             s.farTicks += 1
             s.nearTicks = 0
+            s.nearSince = 0
             if s.farSince == 0 { s.farSince = s.now }
         } else {
-            // 死区 / 数据勉强：两个计数都清零，谁也别想靠累积蒙过去
+            // 死区 / 数据勉强：计数清零，谁也别想靠累积蒙过去
             s.nearTicks = 0
+            s.nearSince = 0
             s.farTicks = 0
             s.farSince = 0
         }
 
-        // 确认「真的走了」之后本次到访才算结束。这里用「离开持续时长」而不是
-        // 「判远一次」——否则 GPS 跳一下就把「刚在车旁手动锁过车」这个保护清掉，
-        // 车会自己又弹开。
-        if s.farSince > 0 && (s.now - s.farSince) > c.awayMs {
-            s.unlockedThisVisit = false
+        // 这次到访算不算结束：看「离开最近一次判近」过了多久，而不是「连续判远」多久。
+        // 旧写法要求 farSince 连续累积，而 10~30 米是死区，人在那个区间时 farSince
+        // 每拍清零 → 「离开」永远不成立 → unlockedThisVisit 永不重置 →
+        // 下次真的走到车边也不开锁，而且全程没有任何报错。
+        // 死区只该吃掉抖动，不该把「人已经走了」这个事实一起吃掉。
+        if s.lastNearAt > 0 {
+            let held = s.now - s.lastNearAt
+            let need = s.farTicks > 0 ? c.awayMs : c.awayMs * 2
+            if held > need { s.unlockedThisVisit = false }
         }
 
         if s.busy || !s.armedKnown { return NONE }
 
-        // ① 在车旁且车锁着 → 开锁。
-        // 判近要连续两拍；但蓝牙同时证明「贴着了」就免确认——那条信号比 GPS 精确得多。
-        let needNear = s.bleNear ? 1 : max(1, c.confirmTicks)
+        // ① 在车旁且车锁着 → 开锁。判近要「持续」而不是「N 拍」；
+        //    蓝牙同时证明「贴着了」就免确认——那条信号比 GPS 精确得多。
+        let nearHeld = s.nearSince > 0 && (s.now - s.nearSince) >= c.confirmHoldMs
         if c.autoUnlock && s.armed && !s.moving && near && !s.unlockedThisVisit
-            && s.nearTicks >= needNear
+            && (s.bleNear || nearHeld)
             && (s.now - s.lastUnlockAt) > c.unlockCooldownMs {
             return UNLOCK
         }
 
         // ② 确实走远了 → 锁车。必须本次到访真的到过车旁，
         // 否则车停别处会无限下发锁车指令。
-        if c.autoLock && !s.armed && !s.moving && s.visited && !near && far
-            && s.farTicks >= max(1, c.confirmTicks)
+        let farHeld = s.farSince > 0 && (s.now - s.farSince) >= c.awayMs
+        if c.autoLock && !s.armed && !s.moving && s.visited && !near && far && farHeld
             && (s.now - s.lastLockAt) > c.lockCooldownMs {
             return LOCK
         }
@@ -826,6 +839,9 @@ enum Logic {
         var bleThr = -90
         /// 断开之后多久之内还认为「值得为锁车重连一次」
         var bleReachMs: Int64 = 20000
+        /// 信号已弱于 `bleThr` 时的「加速离开」门槛：到这个程度人肯定不在车边了，
+        /// 不必再等满 `awayMs`（原来转身走开要等 30 秒才锁，体感很慢）。
+        var fastAwayMs: Int64 = 5000
     }
 
     /// 纯函数式决策；会顺带更新 St 里的 visited / awayTicks / unlockedThisVisit / lastNearAt。
@@ -845,8 +861,16 @@ enum Logic {
             s.awayTicks += 1
         }
 
+        // 加速离开：信号已经弱到「绝不可能贴在车边」时，不必再等满 awayMs。
+        // 只缩短确认时间，判据本身没变。
+        var awayLongNow = awayLong
+        if !near && s.fresh && s.rssi < c.bleThr && nearRef > 0
+            && (s.now - nearRef) > c.fastAwayMs {
+            awayLongNow = true
+        }
+
         // 离开得足够久 → 下一次靠近算「新的一次到访」，允许再开一次锁
-        if awayLong {
+        if awayLongNow {
             s.unlockedThisVisit = false
         }
 
@@ -861,8 +885,9 @@ enum Logic {
         }
 
         // ② 确认离开 → 落锁。必须曾经真的靠近过，否则车停别处会无限下发锁车
-        let away = awayLong && s.awayTicks >= c.awayConfirmTicks
-        if c.autoLock && !s.armed && !s.moving && s.visited && !near && away
+        // 1.22 起不再要求「连续 N 拍判远」：iOS 是事件驱动的，两次判定可能隔几分钟
+        // 也可能隔 80 毫秒，「3 拍」在这里毫无意义。时间条件（awayMs=30 秒）才是确认。
+        if c.autoLock && !s.armed && !s.moving && s.visited && !near && awayLongNow
             && (s.now - s.lastLockAt) > c.lockCooldownMs {
             return LOCK
         }
@@ -987,24 +1012,39 @@ enum Logic {
         return !wasArmed && nowArmed && near
     }
 
+    /// 1.22 收紧版：只要「车锁由未锁翻成已锁」就抑制本次到访的自动开锁，不再看是否判近。
+    ///
+    /// 为什么去掉 near：手机落在车里、蓝牙刚好断过一次，都会让「判近」失败，
+    /// 于是抑制失效，下一拍就是「靠近 + 已锁 + 未开过」→ 车自己弹开。
+    /// 而「从没锁变成已锁」本身就说明刚才有人在车边动过它，此时立刻解锁几乎总是错的。
+    ///
+    /// 不会误伤正常开锁：真正走开后 `unlockedThisVisit` 会被重置，下次走近照常开；
+    /// 人就在车边想开锁时，手动按钮一直可用。
+    static func suppressUnlockOnFlip(wasArmed: Bool, nowArmed: Bool) -> Bool {
+        return !wasArmed && nowArmed
+    }
+
     // MARK: iOS 专用的「靠近」判定
 
-    /// 「靠近」在 iOS 上怎么算。与 Android 有一处关键差异，别照抄。
+    /// 「靠近」在 iOS 上怎么算。三级判据，缺证据就不许说「近」。
     ///
-    /// Android 后台能稳定读 RSSI，所以 near 完全由信号决定。
-    /// iOS 的 `readRSSI` 在后台会被系统限流甚至直接不回调，常常拿不到新鲜值；
-    /// 如果坚持用 -127 判距，后台就**永远**不会自动开锁 —— 功能等于没有。
+    /// 1. **有新鲜 RSSI**（10 秒内读到过）→ 严格按用户设的门限。这是唯一有物理含义的距离证据。
+    /// 2. **没有 RSSI，但最近 15 秒收到过 ≥3 帧状态帧** → 链路干净，判近。
+    ///    穿墙时丢包率会明显上升（3 秒一帧变成 6~15 秒一帧），这条正好挡住
+    ///    「人在楼上 / 地库另一层、车在下面、蓝牙却连着」的那种误判。
+    /// 3. **两个证据都没有** → 返回 false。未知不等于近。
     ///
-    /// 所以这里的口径是（已与用户确认的取舍）：
-    /// - 有新鲜信号（10 秒内读到过）→ 严格按用户设的门限；
-    /// - 没有信号 → 信「能连上」这件事本身。车机能被连上，本身已经意味着
-    ///   大概在 10 米以内，比"一律当作很远"更接近事实。
-    ///
-    /// 误开的兜底不在这里，而在 `decide` 的三道闸门：本次到访已开过不再开、
-    /// 开锁冷却 60 秒、车辆行驶中不开。
-    static func nearAssumeByLink(rssi: Int, thr: Int, fresh: Bool) -> Bool {
-        return fresh ? rssi >= thr : true
+    /// 为什么不能再用「连着就算近」：iOS 后台 `readRSSI` 会被限流甚至直接不回调，
+    /// 旧口径等于「永远判近」。地库里 GPS 失效、蓝牙穿墙连着 → 车直接被解开，
+    /// 而人根本不在车边。宁可这一次不开锁（用户掏手机点一下），
+    /// 也不能在没有证据的时候把车打开。
+    static func nearAssumeByLink(rssi: Int, thr: Int, fresh: Bool, frameCount: Int) -> Bool {
+        if fresh { return rssi >= thr }
+        return frameCount >= 3
     }
+
+    /// 统计「最近这段时间收到几帧状态帧」用的窗口。车机 3 秒一帧，15 秒正常能收到 4~5 帧。
+    static let FRAME_WINDOW_MS: Int64 = 15000
 
     /// RSSI 多旧就算「没有新鲜值」。车机 3 秒一帧，10 秒已经足够宽裕。
     static let RSSI_FRESH_MS: Int64 = 10000
@@ -1086,13 +1126,27 @@ enum Logic {
 /// 真正的省电靠「后台不进轮询，只在 BLE 事件里跑一拍」。
 enum Power {
 
-    /// 断开状态下重连尝试的最小间隔（熄屏/后台）
+    /// 断开状态下重连尝试的最小间隔（熄屏/锁屏）
     static let RECONNECT_MIN_SCREEN_OFF: Int64 = 30000
     /// 断开状态下重连尝试的最小间隔（亮屏/前台，用户可能就在车边）
     static let RECONNECT_MIN_SCREEN_ON: Int64 = 12000
     /// 重连退避上限
     static let RECONNECT_MAX_SCREEN_OFF: Int64 = 90000
     static let RECONNECT_MAX_SCREEN_ON: Int64 = 45000
+
+    /// 重连最小间隔（App 已进后台）。
+    ///
+    /// 这一档看着比熄屏还慢，但它治的是另一个病：
+    /// 开着「后台定位」时 App **不会被挂起**（定位回调一直在给执行时间），
+    /// 于是人车分离一整夜，重连逻辑会一整夜真的跑起来 ——
+    /// 按前台 12 秒算是一夜 7200 次 connect，按 60 秒算是 1440 次。
+    ///
+    /// 而且这 60 秒不牺牲可用性：真正能在后台把车机等回来的，是
+    /// `CBCentralManager.connect()` 交出去的那次 **pending 连接**（由系统蓝牙栈持有，
+    /// App 睡着也在等），我们定时重提只是兜底防止它因蓝牙重启而失效。
+    static let RECONNECT_MIN_BACKGROUND: Int64 = 60000
+    /// 后台上限。走到这里说明人车确实长期分离，5 分钟重提一次足够兜底。
+    static let RECONNECT_MAX_BACKGROUND: Int64 = 300000
 
     /// 主循环节拍。
     ///
@@ -1117,9 +1171,22 @@ enum Power {
 
     /// 断线后隔多久再尝试连接。连续失败次数越多，退避越久（防止人车分离时长期空转）。
     /// 亮屏时明显更积极：用户拿起手机往往就是要用车。一旦连上就把失败计数清零。
-    static func reconnectDelayMs(fails: Int, screenOn: Bool) -> Int64 {
-        let base = screenOn ? RECONNECT_MIN_SCREEN_ON : RECONNECT_MIN_SCREEN_OFF
-        let cap = screenOn ? RECONNECT_MAX_SCREEN_ON : RECONNECT_MAX_SCREEN_OFF
+    ///
+    /// 三档优先级：**后台 > 熄屏 > 亮屏**。`background` 一定要由调用方传真实值，
+    /// 写死成前台会让「开着后台定位过夜」变成整夜空转。
+    static func reconnectDelayMs(fails: Int, screenOn: Bool, background: Bool = false) -> Int64 {
+        let base: Int64
+        let cap: Int64
+        if background {
+            base = RECONNECT_MIN_BACKGROUND
+            cap = RECONNECT_MAX_BACKGROUND
+        } else if screenOn {
+            base = RECONNECT_MIN_SCREEN_ON
+            cap = RECONNECT_MAX_SCREEN_ON
+        } else {
+            base = RECONNECT_MIN_SCREEN_OFF
+            cap = RECONNECT_MAX_SCREEN_OFF
+        }
         var d = base
         var i = 1
         while i < fails && d < cap {
@@ -1127,6 +1194,16 @@ enum Power {
             i += 1
         }
         return min(d, cap)
+    }
+
+    /// 回前台时，隔多久才值得再向服务器要一次状态。
+    ///
+    /// 原来每次切回前台都发一次请求。用户反复切 App（看一眼、切出去回消息、
+    /// 再切回来）时，这等于把网络轮询又加回来了。
+    /// 蓝牙有新鲜状态帧的时候根本不缺这一下，只做一个很松的兜底；
+    /// 没有蓝牙帧（人在外面）才需要勤一点。
+    static func statusMinGapMs(bleFresh: Bool) -> Int64 {
+        return bleFresh ? 60000 : 20000
     }
 
     /// 界面说明用：这个轮询间隔相当于一天请求多少次
@@ -1723,21 +1800,31 @@ final class Notify: NSObject {
     /// 这里是**我们主动没发**，因为门开着锁了也不算数。
     /// 通知上给「仍然锁车」：有时候人就是想先把车锁上再去关门，不能被判断卡住。
     @discardableResult
-    func doorBlocked(doorOpen: Bool, trunk: Bool) -> Bool {
-        let what: String
-        if doorOpen && trunk {
-            what = "车门和尾箱都没关好"
-        } else if trunk {
-            what = "尾箱没关好"
-        } else {
-            what = "有车门没关好"
-        }
+    func doorBlocked() -> Bool {
+        // 1.22 起不再区分尾箱：这台车机不区分哪一扇门，任一门开都是低 4 位全 1
+        let what = "有车门没关好"
         let c = UNMutableNotificationContent()
         c.title = "\(what)，没有自动锁车"
         c.body = "门开着锁了也等于没锁。关好门会自动补锁；想现在就锁，点「仍然锁车」。"
         c.sound = .default
         c.categoryIdentifier = Notify.catDoorOpen
         post(id: "sxkc.auto.dooropen", content: c)
+        return true
+    }
+
+    /// 指令发出去了，但 20 秒内车机状态一次都没翻转。
+    ///
+    /// 1.22 新增。以前这种情况只往日志里写一行「无法确认」，界面继续显示「已锁车」——
+    /// 明明没确认，却像个成功。现在必须让人知道「这一笔没算数」。
+    func lockUnconfirmed(distText: String) -> Bool {
+        let c = UNMutableNotificationContent()
+        c.title = "锁车没能确认"
+        c.body = distText.isEmpty
+            ? "平台已受理，但 20 秒内车机状态没变化，很可能指令还在队列里。请确认一下车锁了没。"
+            : "平台已受理，但 20 秒内车机状态没变化（\(distText)）。请确认一下车锁了没。"
+        c.sound = .default
+        c.categoryIdentifier = Notify.catDoorOpen
+        post(id: "sxkc.auto.lockunconfirmed", content: c)
         return true
     }
 
@@ -3093,8 +3180,11 @@ extension BleCentral: CBCentralManagerDelegate {
 
     func centralManager(_ central: CBCentralManager,
                         willRestoreState dict: [String: Any]) {
-        if let ps = dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral],
-           let p = ps.first {
+        let restored = (dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral]) ?? []
+        // 恢复列表里可能不止一台（诊断页扫过的设备也会被记着），
+        // 必须先挑出我们记住的那台车机，否则会去连别人的设备。
+        let hit = restored.first { $0.identifier == savedUuid } ?? restored.first
+        if let p = hit {
             peripheral = p
             p.delegate = self
             connected = (p.state == .connected)
@@ -3102,11 +3192,26 @@ extension BleCentral: CBCentralManagerDelegate {
             if connected {
                 // 进程被杀过再恢复时，特征引用和会话密钥都没了，光"连着"发不出指令。
                 // 重新走一遍服务发现 → 订阅 → 握手，链路在就不会再花连接时间。
+                // 保活心跳会在 ready 置位时重新挂上（见 ready = true 那一处）。
                 ready = false
                 chr = nil
                 busKey = nil
                 p.discoverServices(nil)
+            } else {
+                // 拿回了外周对象但链路是断的：照样把连接请求交出去，
+                // 否则这次唤醒之后又回到「用户不打开 App 就永远连不上」。
+                ready = false
+                log("后台恢复：外周未连接，重新提交连接")
+                ensureConnected()
             }
+        } else {
+            // 系统为蓝牙事件把 App 捞起来，但恢复状态里一个外周都没有
+            // （很常见：车机在我们睡着的时候才广播）。此时如果不主动把连接请求
+            // 交出去，这次唤醒就白费了，接下来只能等用户自己打开 App。
+            connected = false
+            ready = false
+            log("后台恢复：没有拿到外周，主动补一次连接请求")
+            ensureConnected()
         }
     }
 
@@ -3364,7 +3469,7 @@ final class AutoEngine: NSObject, ObservableObject {
     /// 参与了编译，界面上才会跟着变。
     ///
     /// 每次改源码就换一个值，装完瞄一眼底部就知道装的是哪一次构建。
-    static let buildTag = "b1109w"
+    static let buildTag = "b1109y"
 
     let ble = BleCentral()
     let api = CarAPI()
@@ -3447,6 +3552,11 @@ final class AutoEngine: NSObject, ObservableObject {
     private var rssiSmooth = -127
     private var reconnectFails = 0
     private var nextReconnectAt: Int64 = 0
+    /// 是否在后台。省电退避、轮询节流都要看它 —— 之前这里写死成「前台」，
+    /// 结果开着后台定位过夜时按 12 秒一次地重连 Bluetooth（见 Power 的注释）。
+    private var isBackground = false
+    /// 进后台时申请的那点收尾时间，用完要主动 end，否则会被系统强杀
+    private var bgTask: UIBackgroundTaskIdentifier = .invalid
     /// 断线重试令牌：重新排一次就把旧的那次作废，避免每次断开都叠一个定时器
     private var reconnectToken = 0
 
@@ -3507,14 +3617,35 @@ final class AutoEngine: NSObject, ObservableObject {
     private var doorKnown = false
     /// 是否有车门开着。这台车机不区分哪一扇，任一门开就是 true
     private var doorOpen = false
-    /// 尾箱是否开着
+    /// 尾箱位（body[3] bit4）。1.22 起不再采信：三份实车日志里从没单独出现过，
+    /// 而万一这个位另有含义就会永久拦住锁车。字段留着只为兼容旧接口。
     private var doorTrunk = false
     /// 最近一次拿到门位的时刻（ms）。超过 doorStaleMs 就不采信
     private var doorMs: Int64 = 0
     /// 上一次因为车门没关而拦下锁车的时刻，用来给通知限频
     private var doorBlockAt: Int64 = 0
+    /// 锁车前为拿一份「新鲜门位」而主动连蓝牙的截止时刻。0 = 没在等
+    private var doorWaitUntil: Int64 = 0
     /// 门位有效期：3 秒一帧，断开 / 省电之后会停在旧值上，过期就不能再拿它拦锁车
     private let doorStaleMs: Int64 = 30000
+
+    // MARK: 网络指令待确认（1.22）
+    /// 网络指令已受理、等状态帧确认。0 = 没有待确认的
+    private var netPendAt: Int64 = 0
+    /// 这条待确认的指令是不是开锁
+    private var netPendUnlock = false
+    /// 是不是自动决策触发的（决定确认后要不要发通知）
+    private var netPendAuto = false
+    /// 已经补发过几次
+    private var netPendRounds = 0
+    /// 最后没能确认：界面必须如实显示，而不是继续挂着「已锁车」
+    @Published var netUnconfirmed = false
+    /// 最近一次从状态帧拿到锁态的时刻。用来区分「指令之后真翻转」和「本来就等于期望值」
+    private var lastArmedFrameAt: Int64 = 0
+    /// 最近 15 秒收到的状态帧时刻，用来在拿不到 RSSI 时判断「链路是否干净」
+    private var frameTimes: [Int64] = []
+    /// 当前为什么不动手，直接显示在状态卡上
+    @Published var whyText = ""
 
     /// 围栏半径（米）。只影响耗电与唤醒时机，不参与「10 米开锁 / 30 米锁车」的判定
     private let fenceRadiusM = 300.0
@@ -3702,11 +3833,16 @@ final class AutoEngine: NSObject, ObservableObject {
         rssiSmooth = -127
         lastRssiValue = -127
         lastRssiAt = 0
+        frameTimes.removeAll()
         lastUnlockAt = 0
         lastLockAt = 0
         lastPollAt = 0
         lastNetAt = 0
         netRetried = false
+        netPendAt = 0
+        netUnconfirmed = false
+        doorWaitUntil = 0
+        whyText = ""
         lastResult = ""
         car = nil
         lockedForThisVisit = false
@@ -3756,12 +3892,14 @@ final class AutoEngine: NSObject, ObservableObject {
         // decide 只看 st.rssi，所以这里在"无信号"时把它顶到门限，
         // 等价于把 near 判成 true，而不必改动共享的决策函数。
         let rssiFresh = lastRssiAt > 0 && (now - lastRssiAt) < Logic.RSSI_FRESH_MS
-        let near = Logic.nearAssumeByLink(rssi: rssiSmooth, thr: cfg.thr, fresh: rssiFresh)
+        let near = Logic.nearAssumeByLink(rssi: rssiSmooth, thr: cfg.thr,
+                                          fresh: rssiFresh, frameCount: recentFrameCount(now))
         st.rssi = near && !rssiFresh ? cfg.thr : rssiSmooth
 
         // 断线后按退避重连（人车分离时不要 4 秒一次地空转）
         if running && !ble.isConnected && !ble.busy && now >= nextReconnectAt {
-            let d = Power.reconnectDelayMs(fails: max(1, reconnectFails), screenOn: true)
+            let d = Power.reconnectDelayMs(fails: max(1, reconnectFails),
+                                           screenOn: screenOn, background: isBackground)
             nextReconnectAt = now + d
             reconnectFails = min(reconnectFails + 1, 6)
             ble.ensureConnected()
@@ -3790,17 +3928,45 @@ final class AutoEngine: NSObject, ObservableObject {
             // 门位超期（断连 / 省电熄屏 / 刚启动还没收到状态帧）一律当"未知"，
             // 不拦锁车 —— 拿一份过期数据把车卡住不让锁，比不拦更危险。
             let nowMs = CarAPI.nowMs()
-            let doorFresh = doorKnown && (nowMs - doorMs) < doorStaleMs
-            if store.flag(StoreKey.doorGuard, true),
-               Logic.doorBlocksLock(doorKnown: doorFresh, doorOpen: doorOpen || doorTrunk) {
-                log("⚠ 检测到\(doorOpen ? "车门" : "尾箱")没关好，本轮不落锁（关好后会自动补锁）")
-                if store.notifyEnabled, nowMs - doorBlockAt > 60000 {
-                    doorBlockAt = nowMs
-                    Notify.shared.doorBlocked(doorOpen: doorOpen, trunk: doorTrunk)
+            var doorFresh = doorKnown && (nowMs - doorMs) < doorStaleMs
+
+            // ── 先补一份新鲜门位（1.22）──
+            // 走网络锁车时蓝牙通常已经断开，门位必然过期，门闸就被整个跳过 ——
+            // 而「人走远了、门没关严」恰恰是最需要门闸的场景。
+            // 所以先主动连一次蓝牙，最多等 8 秒；拿到状态帧就按真实门位判，
+            // 等不到才放行，并如实记一条日志。
+            var holdForDoor = false
+            if store.flag(StoreKey.doorGuard, true), !doorFresh, ble.hasSavedTarget {
+                if doorWaitUntil == 0 {
+                    doorWaitUntil = nowMs + 8000
+                    log("锁车前门位未知 → 先连蓝牙拿一次门位（最多等 8 秒）")
+                    ble.ensureConnected()
+                    whyText = "正在确认车门状态，最多等 8 秒…"
+                    holdForDoor = true
+                } else if nowMs < doorWaitUntil {
+                    holdForDoor = true
+                } else {
+                    doorWaitUntil = 0
+                    log("⚠ 8 秒内没拿到门位 → 按门位未知处理，照常锁车")
                 }
+            }
+
+            if holdForDoor {
+                // 这一拍本来要锁，现在先等门位：不写 lastLockAt、不进冷却
             } else {
-                log("◇ 判定（\(reason) · \(src)）：确认离开 → 锁车")
-                requestAction(unlock: false, auto: true)
+                doorFresh = doorKnown && (CarAPI.nowMs() - doorMs) < doorStaleMs
+                if store.flag(StoreKey.doorGuard, true),
+                   Logic.doorBlocksLock(doorKnown: doorFresh, doorOpen: doorOpen) {
+                    whyText = "有车门开着，暂停锁车（关好会自动补锁）"
+                    log("⚠ 检测到车门没关好，本轮不落锁（关好后会自动补锁）")
+                    if store.notifyEnabled, nowMs - doorBlockAt > 60000 {
+                        doorBlockAt = nowMs
+                        Notify.shared.doorBlocked()
+                    }
+                } else {
+                    log("◇ 判定（\(reason) · \(src)）：确认离开 → 锁车")
+                    requestAction(unlock: false, auto: true)
+                }
             }
         }
 
@@ -3817,7 +3983,43 @@ final class AutoEngine: NSObject, ObservableObject {
         }
 
         updatePowerText()
+        refreshWhy(now)
         checkVerify(now: now)
+    }
+
+    /// 算出「现在为什么不动手」，直接显示在状态卡上。
+    ///
+    /// 1.22 新增。以前这些理由只写在日志里，用户想知道「刚才走到车边为什么没开锁」
+    /// 只能去诊断页逐条翻 —— 而这恰恰是最常被问的问题。
+    private func refreshWhy(_ now: Int64) {
+        if !store.flag(StoreKey.autoOn, true) { whyText = "自动模式已关闭"; return }
+        if store.washUntil > now { whyText = "洗车 / 代客模式：自动判定已暂停（手动照常）"; return }
+        if netPendAt > 0 { whyText = "指令已发出，等车机确认…"; return }
+        if doorWaitUntil > 0 { whyText = "正在确认车门状态，最多等 8 秒…"; return }
+        if !armedKnown { whyText = "还没收到车锁状态"; return }
+        if isNearNow() {
+            if !armed {
+                whyText = "在车旁 · 车是锁着的状态"
+            } else if st.unlockedThisVisit {
+                whyText = "本次到访已开过锁；走开再回来才会自动开"
+            } else {
+                whyText = "在车旁 · 开锁冷却中"
+            }
+            return
+        }
+        if geoActive, !geoSt.dist.isNaN {
+            let inM = store.geoNearM
+            if geoSt.dist > inM && geoSt.dist < inM * 3 {
+                whyText = "距车 \(Int(geoSt.dist.rounded())) 米 · 在死区内，不动作"
+                return
+            }
+        }
+        if !armed && !st.visited { whyText = "没靠近过这辆车，不会自动锁"; return }
+        if doorKnown && (now - doorMs) < doorStaleMs && doorOpen {
+            whyText = "有车门开着，暂停锁车"
+            return
+        }
+        whyText = ""
     }
 
     // MARK: 定位判据
@@ -4079,6 +4281,18 @@ final class AutoEngine: NSObject, ObservableObject {
         }
         if now - lastLockAt <= cfg.lockCooldownMs {
             log("距上次锁车不足冷却时间，跳过")
+            return
+        }
+        // 断开即锁也要过门闸：这条路径同样会"人走了、车锁上"，
+        // 而门没关严的时候锁了等于没锁。
+        if store.flag(StoreKey.doorGuard, true), doorKnown,
+           (now - doorMs) < doorStaleMs, doorOpen {
+            whyText = "有车门开着，暂停锁车（关好会自动补锁）"
+            log("⚠ 断开时车门还开着 → 这次不锁，等门关好补锁")
+            if store.notifyEnabled, now - doorBlockAt > 60000 {
+                doorBlockAt = now
+                Notify.shared.doorBlocked()
+            }
             return
         }
         lockedForThisVisit = true
@@ -4546,9 +4760,6 @@ final class AutoEngine: NSObject, ObservableObject {
         } else {
             lastLockAt = now
             st.visited = false
-            // 锁上了就清掉重试计数
-            autoLockFails = 0
-            autoLockRetryAt = 0
             // 站在车旁用手机锁了车，本次到访就不要再「靠近自动开锁」。
             // 否则人只要在车边站够 60 秒冷却，车就会自己又解开一次。
             // 真正走开（awayLong）之后 Logic 会把它重置，下次走近照常开锁。
@@ -4559,23 +4770,35 @@ final class AutoEngine: NSObject, ObservableObject {
                 bleLockPending = true
                 bleLockPendingAt = now
                 lockFallbackRounds = 0
+                // 只有蓝牙回执能当作"这次锁车在推进中"，网络那条要等状态帧，
+                // 所以重试计数只在蓝牙路径上清
+                autoLockFails = 0
+                autoLockRetryAt = 0
             }
             Stats.lockResult(ok: true)
             Notify.shared.clearLockFailed()
-            if wasAutoLock && store.notifyEnabled {
+            // 网络"已受理"不能拿来当"已锁车"报喜，通知要等状态帧确认后再发（见 checkVerify）
+            if channel == Logic.CH_BLE, wasAutoLock, store.notifyEnabled {
                 let d = notifyDistText()
                 Notify.shared.autoLocked(distText: d)
                 log("· 已发通知：已自动锁车" + (d.isEmpty ? "" : " · \(d)"))
             }
         }
         statsText = Stats.summary()
-        // 网络成功是"权威"的，直接把状态改过来，并清掉蓝牙待核实；
-        // 蓝牙成功则交给状态帧确认
+        // ── 网络通道不再「受理即成功」（1.22）──
+        // 平台回 ok 只说明云平台收下了指令：车机离线、指令排队、门没关严被拒绝，
+        // 都会走这条路，而状态帧纹丝不动。以前这里直接把 armed 改掉，
+        // 界面就报「已锁车」，自动锁车也不再重判、重试链被清空 ——
+        // 假锁车一直挂到下次连上蓝牙为止。现在只登记待确认，锁态由状态帧说了算。
         if channel == Logic.CH_NET {
-            armed = !unlock
-            armedKnown = true
-            bleLockPending = false
-            bleUnlockPending = false
+            netPendAt = now
+            netPendUnlock = unlock
+            netPendAuto = wasAutoLock
+            netPendRounds = 0
+            netUnconfirmed = false
+            lastResult = "已发出，等车机确认"
+            whyText = "已发出指令，等车机确认…"
+            log("网络\(unlock ? "开锁" : "锁车")已受理 → 等状态帧确认（不预先改写锁态）")
         }
     }
 
@@ -4635,6 +4858,50 @@ final class AutoEngine: NSObject, ObservableObject {
                 }
             }
         }
+
+        // 网络通道的"受理"核实。必须是一次**在指令之后**到达的锁态，
+        // 不能用"本来就等于期望值"蒙过去（比如对着一辆已锁的车再点一次锁车）。
+        if netPendAt > 0 {
+            let age = now - netPendAt
+            let framed = lastArmedFrameAt > netPendAt
+            if framed && armed == !netPendUnlock {
+                let wasUnlock = netPendUnlock
+                let wasAuto = netPendAuto
+                netPendAt = 0
+                netUnconfirmed = false
+                log("✓ 车机已确认：\(wasUnlock ? "已解锁" : "已锁车")（状态帧翻转，耗时 \(age) ms）")
+                if !wasUnlock {
+                    autoLockFails = 0
+                    autoLockRetryAt = 0
+                    if wasAuto && store.notifyEnabled {
+                        let d = notifyDistText()
+                        Notify.shared.autoLocked(distText: d)
+                        log("· 已发通知：已自动锁车" + (d.isEmpty ? "" : " · \(d)"))
+                    }
+                    whyText = "已锁车（车机已确认）"
+                } else {
+                    whyText = "已解锁（车机已确认）"
+                }
+            } else if age > Logic.VERIFY_WINDOW_MS {
+                let wasUnlock = netPendUnlock
+                netPendAt = 0
+                netUnconfirmed = true
+                log("⚠ 平台已受理，但 \(age / 1000) 秒内车机状态没翻转 → 这条\(wasUnlock ? "开锁" : "锁车")无法确认")
+                if !wasUnlock {
+                    if autoLockFails < 3 {
+                        autoLockFails += 1
+                        autoLockRetryAt = now + 45000
+                        log("↻ 45 秒后重试自动锁车（第 \(autoLockFails)/3 次）")
+                    }
+                    if store.notifyEnabled {
+                        Notify.shared.lockUnconfirmed(distText: notifyDistText())
+                    }
+                    whyText = "⚠ 锁车没能确认，45 秒后重试"
+                } else {
+                    whyText = "⚠ 开锁没能确认，车可能还锁着"
+                }
+            }
+        }
     }
 
     /// 核实失败时补一次网络指令。补发前把通道标记改成网络，
@@ -4677,16 +4944,36 @@ final class AutoEngine: NSObject, ObservableObject {
         }
     }
 
+    /// 当前是否真的在屏幕上。省电退避按它分档，不能写死。
+    private var screenOn: Bool {
+        return UIApplication.shared.applicationState == .active
+    }
+
     /// App 回到前台。原来靠定时器轮询网络，现在没有定时器了，
     /// 改成「一进前台就补一次真实状态」——这也正是用户最需要看到最新状态的时候。
     func onForeground() {
         guard signedIn else { return }
+        isBackground = false
+        endBgTask()
         log("· 回到前台")
+        // 人就在眼前，退避从头算：这一下很可能就能连上，没必要还压着 5 分钟
+        reconnectFails = 0
+        nextReconnectAt = 0
         // 每次回前台先刷一次小组件：用户很可能是在桌面上看了一眼小组件、
         // 觉得不对才点开 App 的，这时候界面上的数必须和桌面上的对齐。
         pushWidget(force: true)
-        lastPollAt = CarAPI.nowMs()
-        refreshStatus()
+
+        // 回前台不再无条件发请求。用户反复切进切出（看一眼、回条消息、再切回来）
+        // 时，原来那版等于把网络轮询又加了回来 —— 见 Power.statusMinGapMs。
+        let now = CarAPI.nowMs()
+        let bleFresh = ble.lastSeenMs > 0 && (now - ble.lastSeenMs) < store.cfg.freshMs
+        let gap = Power.statusMinGapMs(bleFresh: bleFresh)
+        if lastPollAt == 0 || now - lastPollAt >= gap {
+            lastPollAt = now
+            refreshStatus()
+        } else {
+            log("· 距上次查询 \(max(0, now - lastPollAt) / 1000)s（<\(gap / 1000)s），这次不查网络")
+        }
         refreshStats()
         if running {
             // 仅前台模式下，进后台时定位被停掉了，回前台要重新拉起来
@@ -4700,10 +4987,45 @@ final class AutoEngine: NSObject, ObservableObject {
     /// 进后台。只有「仅前台定位」这一档才真的停；
     /// 开了后台定位就必须让它继续跑，否则锁屏后判不了距离。
     func onBackground() {
+        isBackground = true
+
+        // 后台第一件事：把这次连接请求交给系统。
+        //
+        // App 一旦被挂起，我们自己排的 asyncAfter / Timer 全都不跑 —— 只有已经交给
+        // CoreBluetooth 的 **pending 连接** 会在后台替我们等车机重新广播。
+        // 所以进后台时如果还没连上，必须补提交一次，否则断开之后就再也没人捞得回来。
+        if running && !ble.isConnected {
+            ble.ensureConnected()
+            log("进后台：已提交一次后台连接请求")
+        }
+
+        // 争取几秒收尾时间：让上面那次 connect、日志落盘、小组件快照都真正写下去。
+        // 少这一步，App 可能在被挂起前就把这次 connect 丢了。
+        beginBgTask()
+
         if !store.locBg {
             loc.stop()
             geoActive = false
         }
+    }
+
+    /// 申请一小段后台执行时间做收尾，最多 5 秒主动归还。
+    /// 不归还的话系统会一直记着这笔配额，反复进出后台容易被降权甚至直接杀掉。
+    private func beginBgTask() {
+        endBgTask()
+        bgTask = UIApplication.shared.beginBackgroundTask(withName: "sxkc.bg.finish") { [weak self] in
+            // 系统说「时间到了」，必须立刻还，否则会被强杀
+            self?.endBgTask()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(5)) { [weak self] in
+            self?.endBgTask()
+        }
+    }
+
+    private func endBgTask() {
+        guard bgTask != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(bgTask)
+        bgTask = .invalid
     }
 
     // MARK: 日志
@@ -4833,7 +5155,8 @@ extension AutoEngine: BleCentralDelegate {
             doorText = "车门：状态未知"
             handleLinkLost()
             if running {
-                let d = Power.reconnectDelayMs(fails: max(1, reconnectFails), screenOn: true)
+                let d = Power.reconnectDelayMs(fails: max(1, reconnectFails),
+                                               screenOn: screenOn, background: isBackground)
                 nextReconnectAt = CarAPI.nowMs() + d
                 reconnectFails = min(reconnectFails + 1, 6)
                 log("已断开，\(d / 1000)s 后重连")
@@ -4883,8 +5206,12 @@ extension AutoEngine: BleCentralDelegate {
     /// 只在门位变化时打日志、刷界面 —— 状态帧 3 秒一帧，全打会把日志刷爆。
     func bleStatusBody(_ b: BleCentral, _ body: [UInt8]) {
         let open = Frame.anyDoorOpen(body)
-        let trunk = Frame.trunkOpen(body)
+        // 尾箱位（bit4）1.22 起不再采信，见 Frame.anyDoorOpen 的注释
+        let trunk = false
         let now = CarAPI.nowMs()
+        // 记一帧心跳：拿不到 RSSI 时，「15 秒内收到几帧」是唯一能反映距离的物理量
+        frameTimes.append(now)
+        if frameTimes.count > 40 { frameTimes.removeFirst(frameTimes.count - 40) }
         let wasFresh = doorKnown && (now - doorMs) < doorStaleMs
         let changed = !wasFresh || open != doorOpen || trunk != doorTrunk
 
@@ -4892,16 +5219,15 @@ extension AutoEngine: BleCentralDelegate {
         doorOpen = open
         doorTrunk = trunk
         doorMs = now
+        // 拿到门位了，"锁车前等门位"这件事就不用再等
+        doorWaitUntil = 0
 
         guard changed else { return }
-        var txt = open ? "有车门开着" : "四门全关"
-        if trunk { txt += " · 尾箱开着" }
-        doorText = "车门：" + (open ? (trunk ? "有门开着 · 尾箱开着" : "有门开着")
-                                    : (trunk ? "尾箱开着" : "全关"))
+        doorText = "车门：" + (open ? "有门开着" : "全关")
         doorShown = true
-        doorAlert = open || trunk
-        log("· 门位 \(Hex.of(body)) → \(txt)")
-        if !open && !trunk {
+        doorAlert = open
+        log("· 门位 \(Hex.of(body)) → \(open ? "有车门开着" : "四门全关")")
+        if !open {
             Notify.shared.clearDoorBlocked()
         }
     }
@@ -4929,7 +5255,17 @@ extension AutoEngine: BleCentralDelegate {
             return false
         }
         let rssiFresh = lastRssiAt > 0 && (now - lastRssiAt) < Logic.RSSI_FRESH_MS
-        return Logic.nearAssumeByLink(rssi: rssiSmooth, thr: store.cfg.thr, fresh: rssiFresh)
+        return Logic.nearAssumeByLink(rssi: rssiSmooth, thr: store.cfg.thr,
+                                      fresh: rssiFresh, frameCount: recentFrameCount(now))
+    }
+
+    /// 最近 15 秒收到几帧状态帧。
+    ///
+    /// 拿不到 RSSI 时（iOS 后台被限流），「连着」本身不能证明离得近——蓝牙穿墙也连着。
+    /// 但丢包率能：在车边 3 秒一帧，15 秒该有 4~5 帧；隔一层楼板通常只剩 1~2 帧。
+    private func recentFrameCount(_ now: Int64) -> Int {
+        frameTimes.removeAll { now - $0 > Logic.FRAME_WINDOW_MS }
+        return frameTimes.count
     }
 
     /// 改「车锁状态」的唯一入口。状态帧和网络查询都必须走这里，
@@ -4938,14 +5274,17 @@ extension AutoEngine: BleCentralDelegate {
         let wasKnown = armedKnown
         let wasArmed = armed
         let prev = armedKnown ? armed : a
-        let nearNow = isNearNow()
         armed = a
         armedKnown = true
-        if Logic.suppressUnlockOnArmedFlip(wasArmed: prev, nowArmed: a, near: nearNow) {
-            // 熄火下车关门，车辆自己上锁，而手机还在旁边 → 绝不能立刻又解开
+        lastArmedFrameAt = CarAPI.nowMs()
+        if Logic.suppressUnlockOnFlip(wasArmed: prev, nowArmed: a) {
+            // 熄火下车关门，车辆自己上锁 → 绝不能下一拍又把它解开。
+            // 1.22 起不再要求「此刻判近」：手机落在车里、蓝牙刚断过，都会让判近失败，
+            // 而「车从没锁变已锁」本身就说明刚才有人在车边动过它。
+            // 正常开锁不受影响：走开 30 秒后这个标记会被重置，下次走近照常开。
             st.unlockedThisVisit = true
             geoSt.unlockedThisVisit = true
-            log("车辆刚上锁（人还在车旁）→ 本次到访不再自动开锁，走开再回来才恢复")
+            log("车辆刚上锁（人还在车旁或手机落在车里）→ 本次到访不再自动开锁；走开再回来才恢复")
         }
         // 锁车状态变了必须立刻让小组件知道；没变就走节流，别每 3 秒推一次
         pushWidget(force: !wasKnown || wasArmed != a)
@@ -5132,6 +5471,276 @@ struct SliderRow: View {
 
 
 // ==========================================================================
+//  SXKC/UI/AppLogo.swift  ——  内嵌的车辆 LOGO
+// ==========================================================================
+
+/// App 界面里的车辆 LOGO（导航栏、登录页、页脚都用它）。
+///
+/// 为什么内嵌 base64，而不是放进 Assets.xcassets：
+/// App 图标（AppIcon）必须走 asset catalog，这是系统硬要求；但界面里这个
+/// 小徽章不必。走内嵌可以少建一个 imageset 目录、少传 4 个文件，
+/// 代价只有 16KB —— UIImage 是懒解码的，不绘制就不占内存。
+///
+/// 用多行字面量而不是 `"a" + "b" + ...`：两百多段相加会超过 Swift 类型检查的
+/// 表达式复杂度上限，直接报 "expression was too complex"。
+/// 换行交给 `ignoreUnknownCharacters` 去忽略。
+///
+/// 图案由 `资源/icon_gen.py` 从实拍车图生成（深色渐变圆角底 + 车模），
+/// 想换车图就改那个脚本重新跑一遍。
+enum AppLogo {
+
+    /// 192×192 PNG（base64）
+    private static let b64 = """
+    iVBORw0KGgoAAAANSUhEUgAAAMAAAADACAYAAABS3GwHAAA+GUlEQVR42u29e3Qb930n+vmBADHAzPCBBx+SKIKSLUsmaVsW
+    /crWImWniWXL2SSWku1NmtjtPftHHm12T+/Ze/fcrexszz3b2sn6Jk53N13Xdty0m8pufG3HbVKnIp02jmXSsk3qbZoDURJB
+    AgOCmBlgQBKY+wfwG84MBiRIkdSD8z1HhyLxGvzm832/CNaRDh8+7HriiScKxr/VtXTX8z03abf7Azf4/H6omcwWAKj1eusy
+    mexWOHTNk9/vOz+by6Vrvd66XC53UpEzzBmXOiINniHp2PDMUhhZSyLr8imaRkCIRn/t7NnfvG1b22YCbAGA+XyhS5bl7fl8
+    oSGbVXcCwNx8fpcDneuHPO6aUwDg8zGnGa/3vNvtlmvcNVl3jWtEljOJySlx9MTg309aRKYLWFtmIOt1AJ09+5s3tbYEfT7P
+    DfP5QtfMTHqPuIPs9wzJjAOPjUtzezi15WPXS36WPU2ZYfx8bPrcyJun1oMRyFpLfCrt8/nCAzk1F55OzXzKke4OVdISjQ31
+    v/Ay3vismjk9JSbHPvxNcgQ4NneNaACNAEXg33L3A7sjW7e2UWmflpTPObfYoWqpjmd/Wl9fN+SucY0I58+Pf/ibfzhechJc
+    WEUfYdU1QFvnJ5t3d267ywG+Q6vFCBzLnszP545Ho1OnFkyj1TGLalYhtuMCBjQA2PvAF+5s29R8cDo1sz+eSH49NzvnmDoO
+    XRblZud2SbKyt6bG7dm0ubm+LtAa0mqb0vL0i+nDhw+7BgYGtCumATRNI4QQjUp9Rcnum0ok/9C5bQ6tpY9AkBej0amXz428
+    eUoDCAG0K8AARXv/lrsf2L1l85b9jrnj0Hr7B5OxiVND//Kzn14xDXDfg1/+BONj+mKxqS85kR2H1lsbhEPBv8vI09kPToz+
+    oJhQW75fsCIfoK6lu/7e3k8+BOLaPxGL/8dCQQs7t8Sh9aRCQQtLsrK3rq5hOBxgO2ddwVF5+sW00SddEwaoa+mu79t7T29a
+    zvxuMpV+1LkVDl1JUjLZu1mWu9RYV7tFZ4LDh12o0jmuWRH409LB1Iz8Ref4HboaKKvmbqn1+mZCDUzzrCs4Kv/0xfTqagBN
+    I3X/4+/q+/be0ysmU191wO8QrsJwqYkJpselal7nQhUVnCBEu3NP9/1iMvVVJ9Lj0NVKaUn5XI3Ht/PGSPjRupbu+stngFJp
+    6n0PfvkTGmrudcDv0NVO4nT6y7UMH761c/vXdQG+IhOoVHNxy90P7A4EAr89EYv/R+d4HbpWHONgMDhUH9zM/82Lf3Hq0KFD
+    NSdPntSWxwADA1pb5yebb9y29Qux2NSXnFCnQ9cSqWou0NLSMuGrb5KP/uLVS5XCo66K0h/A7s5td83MpPc4SS6HrjWam8/v
+    mplJ76lnmf1Ff+BxrTofoGT67H3gC3cqSnafY/c7dC07xbUMH955Q+s3AKIdOnSoZmkTqGT6tG1qPujY/Q5dD/5AIBAednub
+    zv+q//Upa5LMVRbyNJg+zvE5dF34A7nc1pZm7nNLOMGHXQMDTxQ6e/Y319XxD8QTya87R+cQrpMkWV1dw3Cgqc0/8eJfnAIO
+    1QDFqJBBAxSdhO3b2u6auDTe4xybQ9ebFmhsqO8sOsRH8jYmENE6e/Y3z+cLXfMF92edI3PoenOINdQEI5HN2wCAOsQuY9hz
+    27a2zY70d+h61gL1LLMfAI787d8WFhjgiaLtn88XHnCkv0PXe1j0lrsf2A1CNBw+7HLRyM+m1pagE/lxaCNoAdbv3Q4Ah06e
+    JK7HH39CAwCfz3MDHUvokEPXK2Wz6k7Wx+6sa+muP3LkSN5FCLQtN96yaz5f6HJKHhzCBiiRMDrDLgDYtXMPccwfhzaSGeSp
+    qYnoDMD4PIxj/ji0kcygxob6TgBw1bV01xNgi2P+OLSRzCAAuLHrk7tcbVu2MBlFvsU5Foc2EmmoCfo4N+Patq1t8+x8ocM5
+    Eoc2oh/gAgApPd3oHIlDG4kyygzxM55dLgJsIS7vTc6ROLSRiLi8N3kZv8vl7ONyaCOTyzkCh7CBE2Ku+XyhyzkOhzasBphV
+    M44WcGhj+gHIi66GQFBwjsKhDasBUkkx4hyDQxuV3M4RrA0xfn5VN3CqGUlzTtWJAjnkkKMBrifJr2YkrZrXGJ/jaAOHAa4L
+    M6da8C/1uQ5DOAxwzdn2akbSdm5vJaKkQZKVVbsmhxkcBrjqHVoAWC3wO8zgOMFrCvy1AH+klQMAxKdi2rV4/Y4GcKT9ZYGf
+    Sv71AqejFRwNcNWA/0Iiv+pmz9X0HR0NcA3TSqMyywH//Fx2Ta7biQ45DHBVSka3x4ctoZqK4Hd7fFW9z2KMw9U3EZ/XVaZZ
+    jN/J7fGZ3sNhDocB1gT8VqBtCdVAlLRFwCet6HrdHh98XheCPMFMMoaJKU2rzYu232O2Jqi1NspkGkXnu9ErA15CpnPchi+9
+    cDvAXz7A7aTzAmAkMH6e8BwL99wkTo8umCdUG3iZIAEAL9usv0dzw8L71bjd8Hm9aGEDmPfXwJ3JI6Ykkc3lkJ+fx7nR8zg9
+    OqHN5kUS/aigA7WWdemAr82LZLYmqD82Gp3SgCkAQBJAA+siQMLEJNWczfXGGG4H/NWDXp6Z0gAJmXRcf6yBdREXH8GOrXUk
+    FAyiq7sbUwkRr7zxL9q3vvYlkp+fJwDQ3h5BjceNcDAIhvGV3rd8RRvjZcr+JssK3J4aMF4G0WgU3/z617Cjo4NEIrcgEomQ
+    YCgEluXAMD7UeNzIz80TVc0CAAEARZEhywrGL1xAfn4e5y9OIqfm9GiUEdT0u2XScRPQG1gXWYxJrlXGcDvgr6YCU0JtXiQM
+    HyFbQwSRyC0IBkPgeQ7BUAhNLa0IB4PgeA6Ml8G3Hz+MHVvryJbNW9DS0mx6T0VRoCjVR4Eyqgo/U2SK/qNHEQqH8f0f/Dk6
+    O282MYiaUyFLsr2PULouIyUSC9I/LookPzcPUYzrjDI1cQnJtGpikknhPcIH2jRZngHH1SOTjmtFTQKgJnhNlmm4HeBXBv7O
+    7a3kxu1b0drSjK3tEUQiEV16LyxkzpqALUkyevftQyTSgYyqIhabRI1necfsZxgd+OFgELHYJH74P/4bHjl4EL29feA4FoIQ
+    hSAIYBgfeL5oy7Msa/t+k7HJRT8vHCyClzLrXXfdVfacWGySRKMCcmqWCIIAWZKQTKsQJmSoGUmzag7KGLVAmeZwGABXLsy5
+    GDPQx2/tjJC9/+ouNDc3IxKJmKR3rAQmCnwAOlPUeNzgeU4HpJ9hAMb+WiqB1fg4w/igqll856k/w6OPPYbe3r6iJugfAADs
+    3LkLHMcahj2pJZ8kb2Z8xlfBtKuBLMn65xi/p5V4ntMZY2+vWaNJkkyM2mMsehFnxkT9PCeF9wgA8IE2/fz9dWGHAa4mTUCL
+    0x749H3YtXOn9QbrUrzG44afYXSQVzJbKOXn5k3goja5kbJq0bnNWZ7n53i88fpruOueT+jgP3XmDBjGh66uTltzxg70bk+N
+    zhSqmoWiKEUGVBfAbnw+Z/huxtdVYhDK9CzL6kzCMD6IYoJIkoyzZ06hpDXImCBgNDqlJePjAIBAuM1hgKsF/F/+3w6B5XkI
+    wpjJvqbAlEo2tqwU/yZLCyHMhCguBDYlc2hzOsehIAnLvtaUUtC2tzeRL3/py7qNr0gSenp6SjvN+zE0OIjzF+MozJVL7VAw
+    CI7nTf5KJNIBlmUXmMBO4quLX1cwGKpoBhqZpL29HQBw9913mnyVydgkEYQxDA0O4q3BMagZSVOzCmF8rOYwwBXwAaitf2Jk
+    BFED+CmoKaCnc5ytGbW0oyfpTmK11NpICJAgjz72GDiOhZpTIQgCIpEI1JyKZ//nszhz+hRu2rkLu2/ZVaaRJElGNpdDRpYQ
+    FcaQEEVIkgQxkcCjjz2GvSWNUslptpP8lEQxYWvOGc06RVEQjUbBsqxJQzGMD80tzWhvb0dvbx++llMxMjxCToyM4Kc/f5ek
+    xBjWkxHcGx38jV4ZWzd3IKdmkVOz4HjeAATeHI6UJAAhAgBjggCgqBEmMhSwq0diIoFIRwf27LnD5MiGQiH84Ac/gBifwiMH
+    D9r4DlyZKVQKjaLG48Y/vfkmnn7mWW3HTbuINUIFAIIg4MTIiK4xihI/rJs4i2mASv5D2XPV4veh77dz5y50dXehb98+vPDc
+    X+LXx8ccDbBe0Z+OSMRkIgBAJGI/LDseL0Y6ToyMYHBwEMFQCDzPoz7AkplkDGJJ0tH3sSPewFRWU8lq/nz6gf2ESv94PI6e
+    nh4MDPTjzOlTeOTgQciyUkyaMd6K/gX9nWU5QAUOHDiAf/znk2Ro8F188Xf+jQm0iqLgjddfK/5/VkNWSpqulV67nWnFshzC
+    4bBuXlVDxs+lGuRr3/gmlO9+j7wzeGJdNIF7I4M/0sqhPdIBnufgLTmBlcAPAOFwWHf6enp6MDg4iL6+fejs6sKJkRG8/NIR
+    3VRq9MplEt34E5ZSBWPmtjYvku3tTYQ6vpOxSYTDYag5FS+/9BL6+vpM75OfnzdFg+zBtnA9t98UMpl6GVVFc0szBEFAV3c3
+    9vTcYXpMkST99WIiAUmSIYoJRIUxJNMqCnMKJEnCdI7DVw7uw97ePlsmMP7NGgWjYWSWZfHgp+/DBycEzdEAa1jluTVEsPOm
+    bfrvzc3NOsAXi+zk5+axp+cO7Om5A+2RDvT3HzWFPgEUHV7vghaYmNa0T+3bRyKRiO5IU/u85EiTZLoVhTmFSJKE0WhBe/Sx
+    h8uk/wvPP49QsNyXoOabl/GVaYRqaX4ur0eCqKazM62MGWcAUAxa7K2Bfjz9zLParq5uEg4GTRGmoaF3MTQ4CD/HFxm2xAA8
+    z2HHTbvQ0tKsM0Ek0oFwUwtZ64ahDcEAduBv9MqIRLrh8xaBsrU9UjX4KUBYngfPcxATCTz/3HO2NnwwFMLEtKa1NhKypxS5
+    Wcw8YlkObw30Yzo3RvZapH8ikcDQ0CBu7iqWWtBrN4YiabQqI0u2nyUbqkUToqg7ujTTbGRiRZHL/IkFJzhu+/e9vX3oP3qU
+    HHv7bTxy8JBJ4gtjxSiYz+uFPD+vO9JRYQzvDH2IBz99Hzo7u/TXbAozGI+ufWRoQ+YB6gMt8DI+yIqCrq7OiuC3At/o7PkZ
+    BoIgIKUUtAbWRehPY/hyYrpYodkR6anSJpbRf/QoHjl4CJFIOxKiaJL+1NzJqVlkZEmXphVjTyVts1jOgn5PVq2+T4EyhtXf
+    AIBIRweiwlhZnRPPcyazyxhCZmsJ3vj5P+nmJ8uy6GjfjHcGTzgm0Gr7AFtDBFs3h5FTs4hEIrY2vxH4agVgxONx7OnpwfDw
+    MJmY1rQGVtTBr5cBVChPrkRDg4MAgIcOHIAsK5AlGeFwGLKsoL//KDoiEYjxKT1CRSU9NYP8HF+mGWRFgSgm9MgNZQo7B5xl
+    WUiSbCv9jWCvpBmog2zULoqimJJsN5Wy10Zf4vzFOGaSMQjCmK4FIpGI4wSvNjV6ZYSCET2UZ3T2KPDtpP1ikvDr3/gmAJAf
+    vfA8hLExNLAuoocPQyGIiURZOLUSGaW/LBfLLrq6OvF3L78EAEimi4xpl/SizrxVAxgTdsFgCNlcTs9v0O9ITSAjUO2k+1KP
+    0b/bMVcwFEIyrYLjWGTVnK4VQiXtO5yMQRgT0NnZpTOS4wSvgvQ3+gDGEGRnV1fV0n4pILAst2hI0xo3r0b6JxIJ8DwHWVYw
+    MjwMnuf1aAsAuDwLUZRAHWOS7kazg9racoXrYxif7nxyJWdeTCTgZXxlpRlLEY2kTUxrmqpmiVVYFOaUsigY1VzTOc6UYAuH
+    w9i5vZW8P/LRmmqCDWMCNXpl+Ph2KLMa9uzchXA4jHg8XlYIVm0o0fr3iWlNqy3V31tDnDzPLWkK/eKtD0uRoqL0j4siOiLt
+    euGbVbKatQBT0QeQJQkJUYSPD4ArMYIkSZiY1jTYXK8dIy1F1ufX5kVCQ5rGSJAkSZAkGTzPlb2m0StDEARTToAytqMBVsH0
+    4XkeWSmJm3buwrYbbtBDfUuBfzFTwBjxsdr7E9OalknH9bLgxWhk5ARq8yJ55OChou1fitYwXgbH3v41OJ4vZZ6Ln+XiI6DK
+    TJIk3VyQLbF3zhBrz0pJyLVEN38oSI1mD+Nl4GV8Bj9hZYyQUgom5lLVrG6eWcsojHT2fFrLqCqhJll7pAP49QicsSiXSdT0
+    cXmK1YqKJFUl7asBfyWgGBmCZkor0eC7x9C3b59ePCaKCbRt3oKBgX4T8Cm41IykSSVJTh3ibC6n5wPoP1FMIJlWTZqDJqwq
+    EcexEMVEVeDP5nLI5nKQFaWM+ay5BJr4oqYYfY0oJpCfnwfP88ik4/q9URQFkY61d4Td17v9X6zR4SFJErq7I5ct7e0cYTup
+    VpKCSCkF7eWXXiIuD4uZZKyMMUPBIMREAo8cPKTX9GdUFe0cq+cXZElCSiloszWazlxiYiHiRIvk7MhoKlHpX5AEk5S2li/I
+    UjHEmpGlZfkCOVNNkKz7F9QE4nkeCVFEe6TD9Fz6fzWnYnJyEpFIBIqiIBgM6/fRYYAVgp+vIgKzEuAbX2t0MEvlDMTYS/v+
+    yGiFGzgFYBSf7L2TUOkvSzLCwSAGBwfx/vEh3Lu3D9Z+Xcpc9P/vj4xCGBsjPT094HgesiTpP63OuV0phl2Mn4ZYl+sIA4CU
+    HCdiImHKBbg9NQgFgxgThDJtQWlOiZOEQXPwPIdIK4f3R2JrlhC7bjWAHfhplOJyAG9tZPExXl2yppSCFmjhCa0SNTLBYu/z
+    4IGHjf252HXTTXjyu98zSW41p9o2zBsZISGKhOP5imFXygxGBjKSmlNNPoEsSSs+G6MJRSNMHM9DTCTKeik4ntejWlZt6l1B
+    WceGZgBr4ssoAbkl2hArgdyabaX1NsW/e02f0eiVaYTFFmxWZti2ows9PT1Qcyrm5/IIB4OIRqN4++13NT7QBgBEkiTMz+WA
+    EgMY36M482ehFHt4eBhAscqVMuZ0jtOd5krgN0pdZVYDLgP8RofcaF5VCgfLkqSbal5L++bWzc1rmhF2Xa8hT57nF43N296I
+    UgRGTCQgJhKQZcVkCtB/+fl5vRSZPt/OAbaT/CmloBlB+Ll/vd9UK8/xHF547i8hJccJAAhjYxiNTmlbmhtJA+si1vekn8Xz
+    PCKRCPr69gEA3hw4ptEGmEavDJeHNTGmtXUTWGh/ZGsvv7WBZqyN783zHFJKQbPTLPRetRp6FFiWNf3uaABUV/zGh+qIFfw0
+    7r1YPy6VPtTxo/avnR1MEzg5NWsqf7BzhCtRpKMDvb19ejM7AIwJUbw5cEwDQKTkOJHlOu237r6dVDJppnMcxESxz/b9kVE0
+    sC4S6egAMIXR6JTWwLpIfaDFNntMs95GZ5VdgZa0I5q1NjJ3MBSCLM8gIYqmTG9CFPHBiXMaH2jDnp47iLFPIBgKrX0iTM0q
+    pgO+Er2ZqyH9G70y+FCdLhGtTGBXFFYsHfbaAt3P8abS4qyaM9Xf+BgvJicmln2ttHjukYMHCcexC3F/xocjf/PXkJLjhA+0
+    aWpORUvAr2sCFx8x9RnQXmM7p5h+RkopaO8d/9BG283YNswzjA8JUdQ/b7kRGGqOzSRjZdMpgsEwOK4exaDAqFlYTJ0nv3X3
+    ZxEMhkx+wGLh4xUJSBPW668PDUDBT00XCggqlamdLEmynomcSoiYmrikSyBqLtDX3ta1nVRqLqeMIiYS6O8/uizg0/9vb28i
+    d919t26nuz01+OjcqC79aWKKArooEj9GsiyKVNkpphEZkxAItGmUwfjSwCx5bqFBnuNYhIJB/OqtfvCBgmbUTliypyCHTLpe
+    m0mlbKNvLS3NaGBdZHw8avr7TCqF+oYGfOWrj5YlJlmeR2sjIWOX5DURzO7rJdM7Gp3S6M2eSaVIfUMDgOLNJrXTyKTrtQ9+
+    8EO4PV7MKXEyk0pVejtSAg5IbZ1WBEV9yUnNgePqTUC2mjnUH1gs8pNSig0voWAQsdiUbiOLYrwMsNYoTaXxiZWora3d5vu1
+    acbQq9tTY5oE8fmDX8Dg4CBSSsH0WUtntf0lz75b27Onh9ARLNScYVkWjxw8hGdf+IlmFE63NRLy6GOPoaenB4lEwmSGsSyL
+    pk3tGI2+q8HH4rpmAKqeKKfTIbNBnsDLeLF1czM4lkUoHAbHsQgGw/qcnng8TqxtezzPET/HAwChpgzLckiIIjKypIfqjCrX
+    4qARGlKk/oHRTKLdXMbnK7MacmpOt7mNZhg1yyIdPPnUp/eXVWXSKkkAuPDxcNGRbtqqcVy9KVZOzflFmBiHvvR7uHnHNlvT
+    z8/xpK+vF0bzi5pgak5FV1cn/p//8mcYGnyXWF9r13VmY6aQru4uMF4GIUtTzlcffRRf/J1/Q+bn8nTeqW4GyvJCaQY9E47n
+    cPOObXj77XevTyeYgr4h2IJbOyPoaN+Mti1bCAU4nUbAMD6975X+NN48Ks3sHlu371IKZVqnr1mltukavQu/79q5E09/7xkI
+    YwKGhgYRiUTwyMFDxK5/Nh6PQ1HkMr+Edrj19fVWFfWi10avm17n3Xffqc/zWVEYdJHzZ7wMdbuK846WuFctbAAuj58A0FbP
+    /l+EAdZjSBG9mNu6bsADn74PPXv2oJqhrksdrnFA1WL9rxSYi82/qXgDK1SQcjxXxqR212z8v3WcIctyiHREABRLtq2MvRoA
+    RIUaoErXuNa01L3Y2dSA290EJ68XDaBmFXJb1w343L/er4cB6ZwYo6RfiQReErwG6SPLyoqAT00mlmXLVLwVQJXmddrOyzFQ
+    KByGosiIRqNV9RNcMQ2es88lVPpelaZEwKYxSVWzYHke0uhocURLwL+q0l9ngMJcRpf2JVWzplrg//jD38P9n7wfjJfRp4Y1
+    tzTr0t4OyFZNsNTB20mZ+bk8ElJiyQFOVpOjNOcSsdhkcQ5OMGTLpHYm0EqIZTl9zk6lz1oL0NoV9dkBeDnj3e0SbjT/UA2T
+    0Of6+ABmtAKpJ67LxqQR7+7lcM1qMMT/9e9/j/T29iGRSJjm2cuSXHG+PX0cVQ5aWhno2IoS//TpU2AYH1pamhEKhaqyW5cd
+    yjWUANDR6HoJcZWfpa6gcM14ZtYSZqMkXmxqxnLICv5qixRbZ0QguPmypL0V/OtuAv3Jf/oDQge7hkKhZUmramx162zKy8ls
+    UvCfODGCSKRDN0OWmsS8FBiXYlLapQbGvExjtTK0xa4rWY+UUX+DMhoFHW3RvLmrG/n5eSiKXHFomFXCVwP4lTQirYb0X9IH
+    KMxlNGoGrabNf1dPp63jVcl+pk6Zbvp4sSxn0MpgS1VTljnTiQQEQcBdd99dTBYZsrXUnKI30Wg6WEepGGmpRRm0E8rYQVXN
+    VLXl2NaUWU+dPgOf16ubWlT606Z0luXA8ryuiQRBMI2JX6lUr0ZLrVa17qo7wSv1CxgfqzUH6widO2k8WGukh+PYipGUlUY7
+    jO9pXCekKIpp9J91Tn8wFEJ//4CeM6CgpA0oO27aVfGGWrXCYuCnAMpAXbbZslyiA3FpA415THqxL1f/HEnCVGwCWTWn1+4s
+    B+zLNc3WGvhW86ciA9g5xZcj/RuCLQgGQ5AlCZOTk8hFBVSaKlApyULH8VEpaZSCVCpXkvA/+9nP9LF8xrk5NKFmLHmgti6t
+    SYnH40Dp78FgCG5PDSZjk/jOU09ia3tkyZtOGYEChzKC8Xc6vXmtKT83jx+98DxkSUIw3KSXiItiAnt7+9DU0opjb7+NqDCG
+    ru5uUz1UOByGJMl6vdDl+B3LoYQoYu5SbMXRHjvQr7sPsDVE0NzaiqGhQXAci67SSBI7Fb3QEyrb/oShMM10c+fnUeN260Vq
+    tFlFGBPQ338UDz/8MLa2R0w7tYx2N+0BPh8VFu2HpRMNjGNJqpF+doxQymBDUWQEg+EyJjAuyLscomYZz3N45OAhZFQVxtmd
+    VBNPxibxyMFDUNWsbkJSH0yW5KoHCSwm3Y2l48Zzpitg7SpvbwTwsYtcGRPI6hOsxAxyeVj4GC98fKCYuSxFF8pS9IabbYw6
+    GJsqaOx9sVAptfcTpbmdE9Oa9tprrxE6c5/3criUmNBr5+nIvjcHjml0sNV0jsP5j47rZQi0MpNOcP7E7g5SDI/Gl12xWONx
+    Yyo2gaHBQQQYH+pamhEMhm1BS38uhxEqhR2luaIZRzdaGs2pydgkMqqKzMULyM/Nm0yhyyFFkSGMCRDFBGRJKjbbwFpanjN1
+    f+UMwq0wp+DSex/AV7/8voClpP+KNYBdmKkapjgzJuLmHRPYtXNnRXs3HAzi41dfQ/7OO/WJwW//979A3b33YM+eOxYdq0EX
+    vlGn+cSJEfA8jxNnT2DqUk4DgE/vf5DQ/VoPPfQQZFnBz4+8ipiSxLe6u8kPf/Sq1t3dTf748GF8+4kniCAIOHs+rfkBRLbW
+    AQA5n9DQHulYliQ0LdXDQt9BOBIpboCxaSg3gbpK/2CpqIuqZsvCnf1Hj5qiQUst3Vgu+KH3Ogi2ZeoLUyrksvLrTDoO1HLw
+    e/xVhzpX3Qm+nMhQYS6jeRkvqfYQGcaHFjWHo4Pv4p5HHkHq1dcw8Pdv4NHPfqYqwNHnuD01EMYE0HZCKsnPjZ7Xu5UGjh7V
+    b0x9oEXvzpIlCf39A/jUp/dDFON4/rnnyMS0ptEb1+iFCTCLTVKudI0syxWz4DYL9FiWK/ML1tL5zOZyVTunlWaGsixX9jyx
+    NN1ua3sE77zzTqkpSdL7NVye4vCrjlJfcKngkNS43bqvxvMcBEHAqz9/++ouh65kGrk8fjJ1KYoTIyO4/aaQeYVohZumdd6M
+    wK/+BWP/cBSZ536E3v0PFndjVXlDGcaHydgkRDGh25yyPIMtzY36eiM6trw+0ILu7m54GR86O7uKteelKM8777yDn//D30NM
+    JNAaCukCoGlTO4LBsG7+2M0Qstv8aGfzWnuN6ez8SEdEN4usjqf1vKwVlMslWodVTRRmqbmg1t/pnNS77roL22+4gfgYr2nH
+    QCUcGP1Bq09WjfSvxvxZFgNY37BajcD4WG1iWsPQ0CChX4ZuYTRGeIzj8tjOm3ELgA+f+e/Y/NhX0Hz/fcu+uXQsYEopaBxX
+    D1mewWxNUNv7r+4gn3/kIBKJBKFVlSdGRhAKh/Hnz3y/CIg77sQ777yDP33qGU3NqejcsdX0XW/esQ1nz5yq2onDErM07ZZd
+    yIqiL+heCtyXG4lZrgZDlcV4xoFgDOPDls1bTAybn5svM+2MM1qN17WU9K8W8KumAezMosUc5EhpF1c2l9OTMJWiLPo04Yc+
+    hdauLsTjcdutJZUywcWCtTjtroIsz4Dj6pGMj+PpZ57V+vv7ibUDDKb+4XdQm3+D0K4wl4dFYU6Bjw/g5h3bkM3lbMZ3+PSw
+    IV0EUem7LcYAiXhcFwaSVIxKLRZuXQ0ndS1i8NYcjpFJjZGxpUw7RZH1CdJrUZ+2bqUQtJ3QbjCq3TwZ+vPEyMiSQKoEps8e
+    uJ9MimnbyMLEtKahJohP9nboTEybWQAgUNeht0oCErq7u4u5jFLUxJpToNdkzWUYJWslM8YOOHS0uiTJZU3klwP09SAagl5K
+    qyxm2hl9CVlWwPh5kknHbbvCVir9L5sBqtECmXQct+++hXR2dZXV0Rtviml9j0EKGhlGVpSy2T6LDXItLsCwn995006FiPEp
+    08x9KumLCZji7z137EJrS7P+ejqmw2so26Y2rZExq6ndscvo0sIz+nl0RKFSBaCuNPBhGjRQnWlVbJuUK0ad6GORVg7JGFYV
+    /GumASgTqFmFuDx+/Pb9eyvOrrQCIaOqaG+PmOzAYCiErJpDxGZKmHEPljE5ZnUwrRoiFA6jq6tTl1Z2h2/X+ELLOOyy0dYG
+    D8Bcpr0cW53ni5EgRZKQWKFNfyXAv9zrtJ5/Vs3ptWD0O3AcCy/jhZpT4Vql8OeqMcBiznFGTmr7+u4ld91116LlCsbCNWOC
+    y662fqVVlssthabvR6X6UhPOrDuxFgN+tddqjJDQSJOdRLUD+krAbwXjWoOfagvjdzIyrpFBjMO6Llfqr6kGoGZRJh1HINyG
+    Q5//jC4dq6nGND3Hi6orSKstr662p9dW+peYwM52NQLeyAwrAb+xBMLPMLqjWAnUay3trWUnRjNnOREmq2aifz8xMqJn49sj
+    Hfr2HkWR15wh19QJ/p3P3Ueo6eP21Cy7JHm9ifEyULF4V5d164m11kcUE2U1TdZwL6rJ5jLlZQ3VSv/VADmVvHbgtz5/KZBa
+    mcD4XX7wzPcxcPSXpud/5pEv4X//va+siwm36gzg8vhJYS6jbW9vInQJ3WKVmrjK+luraWm0ztOnwBeEsUXNCFGM68kzoy+x
+    nMUb6+XcLgb+lbR42l3/d558EiPDH5Q99urLP0agjsHnD36hbCcx42O1zFzm6tcAPM8jGhX0G26UfrT5/WpmjGoc1rgolvYF
+    j+mO22LhP2NmV5EkU0Gg0eyxfrbdtayl2WMHfBpUoNlq+n/j8ysxvtV3YVkOP3rheYwMf4D6hgbb+UZvDhzTevftM4WoDVlg
+    7ZowgXJqVj8kRZHLuNkacTEySDV1/ust/a1dWfF4HKdGhuHneFNIlEp3u6pXyVCwR4G9WLOMfVP66gOfgjqr2v/d7ndjCfpy
+    tMGJkRH86q1+dHXfimAoBJ7nIYyNmbTBhY+HydDgIPb29q2ptnOvVdeNy8PaJqcqbRu3YxC7ppi1YBJraXU1jivtrfUyPl3q
+    szyPqdgE3nnnHZw5fQrC2Jg+OTrS0YE9e3pw5z33wM8wOiOoahYMinUx1jLmtW42sZIRzIttoK/Uh7GY+WcE8csvHQEfaNN6
+    enoIUGx66enpQTAUMvkDbw2OYW9v36rG/ddNAyy24pL2oQLmun/jFAK7ZXVGJrHLsFqLq6rtGjP2/FYD/ng8jsnJSb3Vkl7L
+    kb/5a/z0py9bVTq5AGBk+AO8/uor2LKtW/vWN36f7Om5w5YJrhT4F5P6q8UEVPqnlIJ2++5byJhQHOtOCxUjHR3o6r5V1wSX
+    oie1yclJwnGsKZN/TTAAx/OLqkfq4Blvup9hAMZc6lBpHIexNoiGJfNz85Dm5LLPMGYbZVkx9fyyLIdIJIJQKFTWX2xN0NE+
+    2YQo6sAPh8MYGnwXTz/zrEbneS5GFz4eJn/077+Fb/zBt/DIwUNlTLCeZLT1jfsRlmvmWsfJL8YE/f1HEWjZRmaSMXxw4pz2
+    2Yd+m3A8j1+89aH2m6ET6NyxlVC/gO4Ma25utt1vsCoMkFMzhbV4Y3qYdgeREEUcD7iwDRympiTcOKdhJlAHpAG/j8cNHg8W
+    Sw5VUxhnzd5a4/qJeBwjw8NQZjWwtQQPHngYXd1d+pRkI/itjES/UzgcRv/Ro3j6vz4FAGTLtm7NOH9fm01XnEL9zPeeBgCd
+    CXAFShuM94ZKcaP0r1TKbddHUHy9iKZQUM/cWz8jIYoQEwkEQ8D7x4fw9PeeIUWT6CX81bPfJd9+4nG8PzKq8YE2zKRSZCaV
+    QjaXK7aqJrQ18FEzBfd62JN29FFmDPB34NwHgzgOICpdyLbzW3yhrc34FYB6zYO6QAtunCt+8bnNxaFINwA4HxWW3L1baRMK
+    w/gQDIbR3h5BZ1cXJicnceb0Kbw10G+alGC/7E02RXQo+PlAm76PYKE0o8m0MNtOOzzzvadxc1c3du3cue7jQoy7zyjQrSCv
+    1ChDiwBNFa9eL2RFwURsUq+Tyqo5U2HcqdNnAACj0Sntd7/yKHnooYfwk5/8LSRJgiAI+OPDj+Pzh37X9FkZWYIsK0jGPtbW
+    IhiybtWg1rBdenoaHwE4nz5fPL/pOV8UF7KuHOdLTUwhMz6BlvbtuBBXEQ8z2C5Noi7QgunNzeBWKbzJ8jy6wmE0NzfjxMgI
+    rPt2jYAwvi4YDCMaFfDsCz/R+ECbDnzjUgh951UjIWhsQgN7K8bHo2Uhvz///vfwp9/5bhVzNOXLAvpS0nwxoC9V0m0aGa8o
+    SMTjFm3ihaLImJq4pJef7+npgSBEceb0KYxGp7TzUYGcjwrY3t5ERqNTGjWD/BwPQRDWLIm6Zgzg83qRkSVTZaCRBgtRBKcT
+    qCeuLADMNnp8RCv4hHMn0XhrBzA+gXQhgyiTzDYWAr7j0bPYRuYg8wQFLYPfAi5r4puxlCEcDqO5tdV0jdTmNxblUUZW1Sy+
+    /8OfaFJynLS1tSPS0QG6CHtiWtNq8yKx2xtGl1UYmWBk+AMce/tt9O3bp0+IqNR2uByQLwX0xTLSS+0AoN1cpmsszVYSEwlM
+    xCbBG5ZsU2tgTBAgJcfJvXv78J0nn9RDoFJynIwMD+P5555F7777yxzsc6Pnr90lecKYgObWVlN9fMzvBRQgNS1C7KJILC6s
+    rJlRIUyfAW4F2seTWQCYVoo/xdBWn5gZwzYwq6IBjBEjq69i7Uwyao0jf/PXmBTe08EPAKdHJ7RMOg41p2JOiYMPtIGuAuID
+    bdr29iYiJhLgA23aTCpFrI5h3759y5L81Jm3gtwI7Ep9E1ZwG0u6F2tTXKx4kI5ZCQbDejOPkSYnJjAandIAkFAwiNdffQUH
+    PvNZSJJETUhy4DOfRV9fH55+5lmTH3J6dEJbq1zQmjFAc2urLoUysoTJiQm8/NIRPfrCsBdR8LlRAyDfuakIunoG+fqFL/px
+    /UJYJOhi8cH0OQDANnSvmYlGp8VVes5UbAJvDhzT+EAbgqGQ3lmWUQqg7ZMdkb1IplUSqLsTY4KA948PkVFA1wjW7Of7x4cg
+    CGMVi8aswKfb1GmD0XKGiy0m/Zczf9TqJxkjbXQHG/2/j/FCFBP6+qf2SAcOP/EnwMJIGjImCHj8iW9jaPBdXWh42DB+8daH
+    xckQ15oGoP2fkxMTpRGD/Xrqe3w8apbh/3gBHjascfkkuXhvK1zZeRR8bmyp25aNtqk+ABDrDUvVyJyprKDa7qKlTKOlyopZ
+    nscbr78GKTlObtu9Rx/0RO3ar//br5JIRwTPP/ccxEQCW/ftw+NPfBsvv3QEL/7oeSLLdRrH1ZdpgZlUCsKYgD09d+j5Bbtr
+    Max+MgHemIW2m6K30nmi9G/G8ZGLaZ+yXILXCz9X3A5P5wyVlvORPT134DtPPYmRY7/C7e46/FKexssvHdFLzf11YSAdX1Pw
+    r3EtEKcPeRUTCfzzb97TQptvLFZcFs0EkxmQuHiOzDU0YO7IiC4hkw0XfDyARqZYXkyZY8STw5BUU5zVHwrpq5SMN4TaqBQE
+    NMlmTJpZr5cm2azJOF1DSJIu/QGQkkpHA+siX/vmH6Bnzx787PXXqarH8PAw2dvbh729ffAyPvzPH/43oua8GuNlyrRAVBjD
+    nffcg5yatS35pjkKnud00FcyW5Y7SZoOB5CkhUSjFeRLjU6xOswcy4LnOX2NrDA2VjaL6P2RUc1d2rHGB9q0V17/JT574H6i
+    zwMCrr1qUDWnYlP7zYRKIhqu5Lj6kgoMa/NzOX1dJ6mt07TZNAltvlGbU+Kl7Y5FM4HStJovrtL8x+LPiYYYnvjpz1Hf0ABS
+    W5Sqt+++hfz2/XuXtUzCDkCVzB+G8WFo8F1IyXHSHLldM45b+f2v/lvs2rlTl5iBlm1EzUgaXc5NWylv270H7x8fIoy3TbPL
+    jVRqEM+qubLkHU0QVgt26yBgK8izuRx8Xq8t0O3Gt9iBnzIntd2NLa3G1aiSJOPll46ggXWRWC6gHastnr2UHCf9R49iPcm9
+    ktHhqGIWaDAYQnt7O2RZQUtLE7775H8mP3rheQhjYySlMPpKU202Tej2QwDwsGGtWJpQXORMH29o2qpps+kyBtFm00RKpvHq
+    y8MY+OXP8K1/90fo7OrSd4VVSuwYs55hPgyWZU3zOa2JsxqPG0NDgzCuOqURDerAsqVBs8nYxxpdVK0oMoYGB/Hij57Hbbv3
+    mPb0Gs2gs+fTmqpmiV05AV2Ct7U9gnA4vGgHm9Uer8ZcoSNdshXKIKx92NbiPuP/BUGAXMqW01DwaHRKW1hdW3T6x8ej4ANt
+    2le/dJDk1Cxeef2XGh9o02ZrggDi67bayb3S+fmLNZW8PzKq/dWP/4rsf+ABnQn6+nrR19eLWGwKgiCQs2dOQRAEDA8PQ0wk
+    dAlB14DS5JKUTINqCQoe68JnWZ5BfQMIH2jTnjj8f5Nv/MG3sP/Aw5iKTYBlgzoYrNqBFrAZbyw1lezMH5qlrM2LJANofKBN
+    27Onh/zh//lnaPTK+Po3vqmvWU0pxSXTYiKBV17/pTaTSpHR6JTmrwtDSo6XnVttXiR2ZQoU/DTBJhmG1Fq3RC4V36fS3Qhy
+    Cm59GpvXW3FyBx0FExXGoMxqyEpJSJKE6RynjzSkkTDGyxh3Huvgl+UZiAkX2tra8ehjj5Gt7RGcjwr44sEDZPDdY5iY1rS1
+    bpwyFj+6L3cRcyX6yxf+l3b6zMdk9y27EColm8LhMJpbmstWcApCFLHYJChTCIKA8wmNJGMfa3ygzVhjQ4ylBhT8RobYsq1b
+    e/FHzxOgWGYQj8fLKk9Roe82GAwBYsJUT0S1wdkzp0Dj/lT637Z7D6LCGD789f8HAOjr24eEKOpziKhWa2Bd5AKAT/beScYE
+    AZMCYBcNotdnJ4XFREJ3gpcDcuOYQd1UCdmPWJGVoraoBHDKpOWzlKYse4gDpDCX0ajgMj5W/L1R15rffvwwRoY/wOEn/gTd
+    3d0Qjx4ljJfR1mOhX+U1qavAgYyXwXvHP9QKcwqhM23o/EfqIFGV3t7ejkik3cQUsqwgGo2SeDyO81EBE7FJiPEpJESROlQk
+    pRT0A77w8XnUNzToUueZ7z2NYDCEO++5R29PtCaYqENsXEQniomyuZw1HrfttOSOSASDg4O6L8LzHDmf0PQRjFKyWDb9yMFD
+    CIZC6OruXnKNqyTJtku57coUrI0pPq8XvpIEt8vS0vegZkoyraIwp1QB8qnSgF5o1sEHduXJi5Usk9o6LaUUIEuS/h5d3bfq
+    1xVLZtYk5l9pg6h7sResxoW8PzKq+evSYPw8afQWpwP7+ADYWoKR4WFT9WgkEkEwFEIk0gGWZdHe3o7OzpsB9JbHwhMJxEWR
+    TMUm9Ni4rCj64NtguAmdXV3oiLTbLthbbPG2n2F0LUCZhjKAERjtpZ1ZKaWgffbA/SQYCiEZ+1i7rWs7oebSK6//Ev/58f9A
+    Hu14zDQpGYuMd1nKZgeAJoMUtwM6HUeeTKuYKQ3UoVlqox9jBLnL4ydqKUDt8qAiyKutyS8GPtKwaoAGtpFO7SN9+/YhGAwh
+    KoxBGBvDeoJ/6S2Rq2QSJePjAKBdMmgHf10YrY2E0PqZMUHAW4NjUDOSRv8eCgYRDDehtaVZD3fSTY2RSFFrVENLTVWj7Yxq
+    TjVVfhqzwsYwHjW/eJ4jvfv2oT3SQfr27cN3nnqy6Me8fxLuWZHM+zdpak7Ff3r8T7X/8EffIIuVHzRtakdWzZnsb2NUxVq0
+    NhGbLM4QNTicRiluN/IRAFTDmHEjyLFGTSd2ZlBKKWjb25vImwPHtO3tTYR2hFW65rUCf9Vh0MvVBnavzaTjGE1DM9qPDWyC
+    oCaI6RyH6ZyG84kEcCYBNfOORgvLqAZpDtbp4xaNuQCjOVNtSJQu5Pvo3Khp4QXNyIpiHOPjUXjYsFZs8veabPM777kHr7/+
+    On71Vj/4QBvOzIq43V2HY3qzzQz+9KlntN//6hcr9gvcvGMbfIzXZP9ToFPTj4K8IAlYzBZXPX64PCibo7mc9aFYtRmhRS0w
+    k0qZQttiIoEG1kWob7NeNv+K8wDrMdKkGAmK6lGeBtZFXHykWFFpqLKUJAlZicekmEZzsE6XhqbsaMnPoE0axpi/Xbm0KMb1
+    8KPVWRbGBMykUthSTIBhfi4HeBl9zeixt9/GT156nSbIkCqw2tnGOgKlYADBOHn5pSN67ZCxKG7Ltm4tm8uRgaNHTc6nsbDO
+    CnKXx08qSXDTcgkzabgCxAfaNFJbp4e01ZyKFBhTseBqS/9qwL/8LZFrzAQeNqzRyMmFj4fJBQDAB7rkMDIFIMHlYSFLxapD
+    qg2M0nMqISJTcvion1FWM2NI4vg53rabiQ5tQoViv2df+IlG0/eZdBwcV192Q/lAm5ZSChDGxgjVJLSBxl8Xxl//r1f08J/x
+    nDMVQLtWEnutqLigpN50zdThXU1cVQv8FWeCl/sBy/EhGC+D+bk6U8LLKClnUimdKWhyjG5+8deF9fr7+kALAnUMguEmBIMh
+    fcBsNTN4KBMYcwBjgmBS326PtxjPFhPoP3oUNB9BJS7tD6D9rm6PF4yXAZV4c0rclA1OxsfBeBn9nK6FGUpYpUFki33flWAN
+    V2NDzHI4vLjMAibHyQg+o7YwvmfJ0UYyDg1YqB+ni+2o/0DX8siSBI7n9VZAqgny8/Om4jJFkfUyXuNN0WbTZHh4GCmloJHa
+    Oh34kY4O9PX10fHmZGR4GIODg0gpBY0yBTWVjDd4PW725QoorPOQMlyLtUCrEVGiTGAshaARBSqBqeqsdBPpY7FkRgMyJcYo
+    v+kNrEvf/GikHVvrSCgYLDqfJQmvj08svTd15IB6bXt7E+mIRNC7bx+GBgfx9DPPap/svZM8eOBh9O7bBzGRIK+99prpva4X
+    sK0mA623IHBficNe6sDUnLoQafGENbs1qGWzfJZ5cPT5F+ScBkyXPT51aYEBrYClxXwppYDburYTSZJIX98+dHZ14cTICG14
+    J4OsCw8eeBgsy0EYE0zSn5pG1wMttbK2Wia5ElrQfSUPrJLUXosDmp+zL+d1e7wVH7Nz3GDKH8xAGBvDHz/+hO3jPT09+rK9
+    l186opdI0O9R6XOvBrpc5lxMQC33vq8l1bRv23nvdGr6vivx4fP5ebhLafyVHsL8XA6FQn7Jf5VoscdmZ3MoaNCvkVJtqXy3
+    tpZBfPI8ef/4cfTccQd27NiB2tpanDp1Cg8+dAAPHngYH37wPl756U9xbuziwtJtVcHVTtWcqavGveL7Tu/9lQR/Y2PjP11R
+    BjAexkpBvi5AsGEC6j/U1zfgwuS09i+/HoQ4dZF4vV5sv+FG5PN5DAz0o//oUYxdSGh+P6drjeuFLpdBlrrv68EA7qv1cK8m
+    84AmvqxEJz80bboBtXmRvDlwTHtz4JitPdzAusiFyWkNG4iM9/Bq9XdcV+OhXY22cSXJnVIKWm1eJLM1Qc1fF0YD6yLGDCf9
+    /0YD/7VyX92OxF8eE9AQLJZoaKHAjyUz2rXw3db7Pl8tGsHt3JLl30DZotpjOZiScsVdAw7orwVyGGCVJJrsAP6aJJdzBA45
+    DHAdJF4cuobMjqvoXruvxoNx7GcH+BvaBzAelMMMDug3tBPsMIMDfCcK5DCDA3iHAao/cIc5HKBv6DzAcm/SRmUYJ/LmJMJW
+    HQhrzUwOaB0GcKSqQ6tC2Yzc4PIy/tPOUTiEjZwJ3ihjOBxyCHpXn+e4zgAFLX/cORKHNpz0r3HNuGbz8xdqPZ4J5zgc2lAa
+    oIR5VyqVnvNz9bPOkTi0kcjP1c9OT6fOuZLiJbUG+Y+cI3FoIxHFvCsuxmd8fi7lHIlDG40S4vQ5Vy45cWle085Sr9ghhzZC
+    BMhV45qZjp077gIAJZMbbWgMRZ2jcWgjUENjKDo9nUrrYVBBuPgx5/cNOkfj0Eax/1Mz6VGdAdKx4RnHDHJoIyXA0pmZ9wHA
+    tfnAwTrHDHJooxDr952cSafHc8mJSzh82FUjnT2ZA4DsvC/bHOLaJEm+zzkmh65Xaqyv/8XFS7E3VDkZw8CApk+FSMeGZ/Ka
+    5yTH+t9wjsmh65E41v9GLpebmI6dO247FuXj0bMCz3EnnaNy6HoknuNOTs/MlDYeHqopOsQGUuVkrLV9Fwdtnp+dm7vROTKH
+    rifp762tjZ/+8O3vF/9yUrNogMMuAJicGj/taAGHrkfpH5ua+rVR+ls0wIAGHHalk38bd7SAQ9eV49tQ9+NMNqOOnXnv/zVK
+    f5vRiE8UqC/Q1NTya+foHLrWyUXIWcbLTEyn0m/CNilmQ6qcjHn9da2hYECQFeUTzjE6dK1SS3PTczPp9Pj46Ac/Lpo+J7Ul
+    GQAAkvGLJ7ZEbrhTKxRUxxRy6Fp1fKEV5ItT8n/NyVM5K/gXZQAAyMy65E2bWnyKrGzRgKBzpA5dS6ZPoLHxny9OxN6cvnRy
+    xE76L8kAqpyMEQ8bbGlqyjimkEPXmukzMRG7FDt/8kXgTg/wj/Mr2A9wqObC6IevzKTT463NTU85x+oQroGNPa3NTU+lpbT7
+    ojDydDG8f2yu0vPJ0m+pEYBo3bff++80aLfH4/EvOcfs0NVKTeHwD3Kzs3PRS+NP5ZITl1ZhQwzRAOCs8NFPCMh74XD4x84x
+    O3S1gh8A4onpF6sB/5I+gJHyWVmayc2dDzUEg37Wn8hkMrc4R+7Q1Qb+C5cm/9JY7LZqDOAwgUNXK7VtaXsqn5/3LIDfPuJz
+    2QxgZALOx9U3hZtOZLK5TxQKeecuOIQrMYh486ZNT6WltDs2mXihCP7KEZ9VYQDKBMn4xWNsfWhnKBg4oaqzoXx+3skTOLRu
+    5Ge5402h0I/TUtodvTT+lByPnis+crGAZfUHXwYl4xePubwcu6m1ZYIQl6qqqpMxdmjNqaGh8Y2G+vpjExOxS8LZ40/ks7KE
+    FTfIXyalpydPZ2ZdcmNDvRYIBIYdbeAQ1qyhnTm7qbX1uVxOnY5Nxf+pmOTCZU6IuGw67FLlv5uYmjj/G7Y+tDMcDp2pra2d
+    cBxkh1aTwuHwjxvq64fiCVGdzc+9EBNOvF1Mcg1ol/O+ZLUvtLHlxt1bNrX0eb3eVkmWb06lph90bp9Dl2Pu8Bx3Mi2l3dOp
+    9JvxC6ffWGhqOXLZ0ReyZhy7ZeeDHZGtuwv5Qr0kyzfLSuZBZ3ujQ6gyusOx/jd4jjuZy6m+ZDI1WixrWH0ia/1lwlt2PtjS
+    FL7J6/W2qjm1Vclkb84o8m7nNjsEm8gO5/f92utlsjPp9HhqJj26IPHXhsh6fbnGlht3h4KNNzY2NtxYyBfqKTPMzs7tdjTD
+    xpX0tbWe46zfd5LxMhO5nOpTc7Nn1wP4684ARtpy4y27fLVMd2Njw40AQBlibm6+cXZurnV+bp4taNoOwFl6fb1szXQRctbt
+    cSu1Hs+Ex+OeZrzMBF1TND2dSq8n6K8YA2w+cLDu4usvpa2ageV9qq+W6Wa83s0+v89PHyvkC/WuGteMA6Nrl+g9pD+zmWxG
+    zeUuZlV1VlGy0fK6ncMu2pu+HvT/A/3ex24sP8oQAAAAAElFTkSuQmCC
+    """
+
+    static let image: UIImage? = {
+        guard let d = Data(base64Encoded: b64, options: .ignoreUnknownCharacters) else {
+            return nil
+        }
+        return UIImage(data: d)
+    }()
+
+    /// 圆角徽章。解码失败时画一个空位，不给用户一个「消失的图标」。
+    @ViewBuilder
+    static func view(_ size: CGFloat, radius: CGFloat? = nil) -> some View {
+        if let img = image {
+            Image(uiImage: img)
+                .resizable()
+                .frame(width: size, height: size)
+                .clipShape(RoundedRectangle(cornerRadius: radius ?? size * 0.24,
+                                            style: .continuous))
+        } else {
+            RoundedRectangle(cornerRadius: radius ?? size * 0.24, style: .continuous)
+                .fill(Color.white.opacity(0.08))
+                .frame(width: size, height: size)
+        }
+    }
+}
+
+
+// ==========================================================================
 //  SXKC/UI/MainView.swift  ——  主界面
 // ==========================================================================
 
@@ -5160,7 +5769,7 @@ struct MainView: View {
         let info = Bundle.main.infoDictionary
         let v = (info?["CFBundleShortVersionString"] as? String) ?? "?"
         let b = (info?["CFBundleVersion"] as? String) ?? "?"
-        return "顺心控车 Lite  v\(v) (\(b)) · \(AutoEngine.buildTag)"
+        return "五菱控车  v\(v) (\(b)) · \(AutoEngine.buildTag)"
     }
 
     private var armedText: String {
@@ -5192,14 +5801,39 @@ struct MainView: View {
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 10)
                     }
+
+                    // 作者信息放最底下：不挡操作，但一眼能找到。
+                    // 微信写成可点的，长按复制比手打十一位数字靠谱。
+                    VStack(spacing: 4) {
+                        HStack(spacing: 6) {
+                            AppLogo.view(14, radius: 4)
+                                .opacity(0.78)
+                            Text("作者：胖胖胖")
+                                .font(.system(size: 11))
+                                .foregroundColor(UI.dim)
+                        }
+                        Text("微信：zhengyongfu")
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundColor(UI.dim.opacity(0.85))
+                    }
+                    .padding(.top, 2)
                 }
                 .padding(16)
                 .padding(.bottom, 24)
             }
             .background(UI.bg.ignoresSafeArea())
-            .navigationTitle("顺心控车")
+            .navigationTitle("五菱控车")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                // 标题栏放 LOGO + 名称，和桌面图标对得上，用户不会怀疑装错 App
+                ToolbarItem(placement: .principal) {
+                    HStack(spacing: 7) {
+                        AppLogo.view(22, radius: 6)
+                        Text("五菱控车")
+                            .font(.system(size: 17, weight: .semibold))
+                            .foregroundColor(UI.text)
+                    }
+                }
                 ToolbarItem(placement: .navigationBarLeading) {
                     Button("卡片") { sheet = .cards }
                         .foregroundColor(UI.accent)
@@ -5300,6 +5934,20 @@ struct MainView: View {
                         .font(.system(size: 12, weight: .medium))
                         .foregroundColor(doorColor)
                     Spacer()
+                }
+
+                // 「为什么现在不动手」。1.22 新增：以前这个理由只写进日志，
+                // 用户想知道「刚才走近了为什么没开锁」必须去诊断页翻。
+                if !e.whyText.isEmpty {
+                    HStack(spacing: 7) {
+                        // 与色点对齐，但不画点，避免和门位那一行抢注意力
+                        Color.clear.frame(width: 7, height: 1)
+                        Text(e.whyText)
+                            .font(.system(size: 11))
+                            .foregroundColor(e.whyText.hasPrefix("⚠") ? UI.warn : UI.dim)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer(minLength: 0)
+                    }
                 }
             }
         }
@@ -6043,13 +6691,17 @@ struct LoginView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("顺心控车")
-                        .font(.system(size: 32, weight: .bold))
-                        .foregroundColor(UI.text)
-                    Text("iOS 版 · 蓝牙直连 + 网络兜底")
-                        .font(.system(size: 13))
-                        .foregroundColor(UI.dim)
+                HStack(spacing: 14) {
+                    AppLogo.view(62, radius: 15)
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("五菱控车")
+                            .font(.system(size: 28, weight: .bold))
+                            .foregroundColor(UI.text)
+                        Text("iOS 版 · 蓝牙直连 + 网络兜底")
+                            .font(.system(size: 12))
+                            .foregroundColor(UI.dim)
+                    }
+                    Spacer(minLength: 0)
                 }
                 .padding(.top, 40)
 
@@ -6101,6 +6753,17 @@ struct LoginView: View {
                             .lineSpacing(4)
                     }
                 }
+
+                VStack(spacing: 3) {
+                    Text("作者：胖胖胖")
+                        .font(.system(size: 11))
+                        .foregroundColor(UI.dim)
+                    Text("微信：zhengyongfu")
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundColor(UI.dim.opacity(0.85))
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.top, 4)
             }
             .padding(20)
         }
