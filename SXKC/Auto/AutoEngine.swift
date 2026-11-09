@@ -68,12 +68,14 @@ final class AutoEngine: NSObject, ObservableObject {
     @Published var fenceEnabled = false
     /// 通知与震动开关（界面绑定）
     @Published var notifyEnabled = false
+    /// 门没关好就不自动落锁（v1.19）
+    @Published var doorGuardEnabled = true
     /// 洗车模式剩余文案；空串表示没开
     @Published var washText = ""
     /// 罚站率统计摘要
     @Published var statsText = ""
     /// 车门状态文案（门位未逆出来，恒为「未知」）
-    @Published var doorText = "车门：状态未知（门位还没逆出来）"
+    @Published var doorText = "车门：状态未知"
 
     // 诊断页
     @Published var diagDevices: [DiagDevice] = []
@@ -151,9 +153,18 @@ final class AutoEngine: NSObject, ObservableObject {
     // MARK: 洗车 / 门位（1.16）
     /// 上一次的洗车状态，只用来在进入 / 退出时打一条日志
     private var washWasOn = false
-    /// 门位是否已知。门位字节没逆出来之前恒为 false，不影响任何现有行为
+    /// 门位是否已知（收到过状态帧）
     private var doorKnown = false
+    /// 是否有车门开着。这台车机不区分哪一扇，任一门开就是 true
     private var doorOpen = false
+    /// 尾箱是否开着
+    private var doorTrunk = false
+    /// 最近一次拿到门位的时刻（ms）。超过 doorStaleMs 就不采信
+    private var doorMs: Int64 = 0
+    /// 上一次因为车门没关而拦下锁车的时刻，用来给通知限频
+    private var doorBlockAt: Int64 = 0
+    /// 门位有效期：3 秒一帧，断开 / 省电之后会停在旧值上，过期就不能再拿它拦锁车
+    private let doorStaleMs: Int64 = 30000
 
     /// 围栏半径（米）。只影响耗电与唤醒时机，不参与「10 米开锁 / 30 米锁车」的判定
     private let fenceRadiusM = 300.0
@@ -176,6 +187,7 @@ final class AutoEngine: NSObject, ObservableObject {
         locBackground = store.locBg
         geoEnabled = store.geoOn
         raceEnabled = store.raceOn
+        doorGuardEnabled = store.flag(StoreKey.doorGuard, true)
         fenceEnabled = store.fenceOn
         notifyEnabled = store.notifyEnabled
         locText = loc.statusText
@@ -423,9 +435,18 @@ final class AutoEngine: NSObject, ObservableObject {
             log("◇ 判定（\(reason) · \(src)）：靠近且已锁 → 开锁")
             requestAction(unlock: true, auto: true)
         } else if act == Logic.LOCK {
-            // 门没关严不落锁：门位未确认前 doorKnown 恒为 false，这一步永远放行
-            if store.flag(StoreKey.doorGuard, false), Logic.doorBlocksLock(doorKnown: doorKnown, doorOpen: doorOpen) {
-                log("⚠ 有车门没关严，本轮不落锁")
+            // 门没关严就落锁 == 没锁。
+            // 门位超期（断连 / 省电熄屏 / 刚启动还没收到状态帧）一律当"未知"，
+            // 不拦锁车 —— 拿一份过期数据把车卡住不让锁，比不拦更危险。
+            let nowMs = CarAPI.nowMs()
+            let doorFresh = doorKnown && (nowMs - doorMs) < doorStaleMs
+            if store.flag(StoreKey.doorGuard, true),
+               Logic.doorBlocksLock(doorKnown: doorFresh, doorOpen: doorOpen || doorTrunk) {
+                log("⚠ 检测到\(doorOpen ? "车门" : "尾箱")没关好，本轮不落锁（关好后会自动补锁）")
+                if store.notifyEnabled, nowMs - doorBlockAt > 60000 {
+                    doorBlockAt = nowMs
+                    Notify.shared.doorBlocked(doorOpen: doorOpen, trunk: doorTrunk)
+                }
             } else {
                 log("◇ 判定（\(reason) · \(src)）：确认离开 → 锁车")
                 requestAction(unlock: false, auto: true)
@@ -989,6 +1010,12 @@ final class AutoEngine: NSObject, ObservableObject {
         log(on ? "双通道竞速：已开启" : "双通道竞速：已关闭（回到单通道优先逻辑）")
     }
 
+    func setDoorGuard(_ on: Bool) {
+        store.putFlag(StoreKey.doorGuard, on)
+        doorGuardEnabled = on
+        log(on ? "门位保护：已开启（有门开着就不自动落锁）" : "门位保护：已关闭（不看门位，到点就锁）")
+    }
+
     func setFence(_ on: Bool) {
         store.fenceOn = on
         fenceEnabled = on
@@ -1452,6 +1479,35 @@ extension AutoEngine: BleCentralDelegate {
         guard running, UIApplication.shared.applicationState == .active else { return }
         if rssiSmooth >= store.cfg.thr && armed && !st.unlockedThisVisit {
             evaluate("信号转强")
+        }
+    }
+
+    /// 状态帧原始 16 字节：门位在这里落定。
+    ///
+    /// `body[3]` 低 4 位非零 = 有车门开着，bit4 = 尾箱。
+    /// 这型车机不区分具体哪一扇门（实测开任意一门，四个门位全置 1），
+    /// 所以只维护一个布尔量，不做单门解析。
+    /// 只在门位变化时打日志、刷界面 —— 状态帧 3 秒一帧，全打会把日志刷爆。
+    func bleStatusBody(_ b: BleCentral, _ body: [UInt8]) {
+        let open = Frame.anyDoorOpen(body)
+        let trunk = Frame.trunkOpen(body)
+        let now = CarAPI.nowMs()
+        let wasFresh = doorKnown && (now - doorMs) < doorStaleMs
+        let changed = !wasFresh || open != doorOpen || trunk != doorTrunk
+
+        doorKnown = true
+        doorOpen = open
+        doorTrunk = trunk
+        doorMs = now
+
+        guard changed else { return }
+        var txt = open ? "有车门开着" : "四门全关"
+        if trunk { txt += " · 尾箱开着" }
+        doorText = "车门：" + (open ? (trunk ? "有门开着 · 尾箱开着" : "有门开着")
+                                    : (trunk ? "尾箱开着" : "全关"))
+        log("· 门位 \(Hex.of(body)) → \(txt)")
+        if !open && !trunk {
+            Notify.shared.clearDoorBlocked()
         }
     }
 
