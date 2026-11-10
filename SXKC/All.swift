@@ -855,7 +855,12 @@ enum Logic {
         /// 刚回连、或只推了半帧的情况下，`fresh` 会是 false，而此时 RSSI 明明
         /// 强得贴车。原来 `near` 同时要求两者，结果就是「人站在车门上，车不开」。
         var rssiFresh = false
+        /// 这一拍的 RSSI。1.28 起引擎填的是**未平滑**的原始读数（拿到读数时），
+        /// 只有读不到新值时才退回平滑值 —— 平滑有 17 秒时间常数，判开锁用它
+        /// 等于让用户在门口多站半分钟。
         var rssi = -127
+        /// 原始读数连续两拍上升（1.28）。配合「差 4dB 也认」把走近的过程提前识别。
+        var rssiTrendUp = false
         var now: Int64 = 0
         var lastSeen: Int64 = 0
         /// 最近一次判定「在近处」的时刻；离开计时以它为准
@@ -884,7 +889,13 @@ enum Logic {
         var thr = -72
         var awayMs: Int64 = 30000
         var freshMs: Int64 = 10000
-        var unlockCooldownMs: Int64 = 60000
+        /// 开锁冷却（1.28 起默认 0，即**没有冷却**）。
+        ///
+        /// 冷却本来是为了挡住「门在 10 米线上抖 → 开了又锁、锁了又开」。
+        /// 但真正挡住这个的是 `unlockedThisVisit`：一次到访只开一次，要等走开
+        /// 30 秒或车自锁后 20 秒才重置。冷却叠在上面只剩一个副作用 ——
+        /// 刚锁完车转身要拿东西，60 秒内怎么都不给开。所以取消。
+        var unlockCooldownMs: Int64 = 0
         var lockCooldownMs: Int64 = 60000
         var awayConfirmTicks = 3
         /// 蓝牙锁车的距离门限（dBm）。离开判定触发时，如果最近一次读到的信号还强于它，
@@ -910,7 +921,14 @@ enum Logic {
         // 1.26 改掉「必须状态帧新鲜」：状态帧断了但 RSSI 还在刷，说明车机就在旁边
         // 只是不肯推帧（车机省电、刚回连、地库信号差）。这时人拉门把手，车不开 ——
         // 用户看到的就是「罚站」。RSSI 强于门限本身已经足够证明人在车边。
-        let near = s.connected && s.rssi >= c.thr && (s.fresh || s.rssiFresh)
+        // 1.28：差 4dB 但正在走强，也算「到了」。
+        //
+        // 走近时原始读数会先跳上去，而平滑值要十几秒才跟上来（见 Cfg 注释）。
+        // 门槛不必等它稳稳越过：趋势成立时给 4dB 宽限，既提前识别，
+        // 又不至于把站在 10 米外的路人算成「贴车」。
+        let reach = s.rssi >= c.thr
+            || (s.rssiTrendUp && s.rssi >= c.thr - TREND_SLACK_DB)
+        let near = s.connected && reach && (s.fresh || s.rssiFresh)
         if near {
             s.visited = true
             s.awayTicks = 0
@@ -1152,6 +1170,19 @@ enum Logic {
     /// 就是典型的一夜不锁车 —— 定位说 40 米不够 100 米、蓝牙说还连着，
     /// 两边都不动作，而界面一切正常。只有**明显强于门限**才算人真在车边。
     static let BLE_REACH_SLACK_DB = 6
+
+    /// 「信号正在走强」时对开锁门限的宽限（dB）。
+    ///
+    /// 走近的那几秒里原始读数已经跳到 -72 附近，但用户还想再稳一点才认；
+    /// 4dB 大约是「一步之内」的差别，配合趋势判断能把开锁提前 5~15 秒。
+    static let TREND_SLACK_DB = 4
+
+    /// 「连上即开」的最低信号底线（dBm）。
+    ///
+    /// 这条不是判据，是**止损**：连接建立后如果读到的第一个 RSSI 比它更弱，
+    /// 说明手机和车之间隔着不止一堵墙（家里、楼上、隔壁车位），这一次不自动开。
+    /// 贴在车门边时几乎不可能低于 -85 —— 那是穿两层混凝土的量级。
+    static let CONNECT_MIN_RSSI = -85
 
     /// 蓝牙信号是否「实质可用」：连着、有读数、且明显强于开锁门限。
     ///
@@ -1668,6 +1699,7 @@ enum StoreKey {
     static let fenceOn = "fence_on"
     /// 双通道竞速：蓝牙与网络同时下发
     static let raceOn = "race_on"
+    static let connectUnlock = "connect_unlock"
     /// 指令通道模式（1.26）：0 智能 / 1 仅蓝牙 / 2 仅网络
     static let chMode = "ch_mode"
     /// 洗车 / 代客模式截止时刻（毫秒）
@@ -1855,6 +1887,17 @@ final class Store {
     var raceOn: Bool {
         get { return flag(StoreKey.raceOn, true) }
         set { putFlag(StoreKey.raceOn, newValue) }
+    }
+
+    /// 连上即开（1.28）。默认**开**。
+    ///
+    /// 开着：蓝牙一建立连接就下发开锁，不等 RSSI 收敛、不等车机状态帧。
+    /// 这是治「罚站」最有效的一条，代价是蓝牙穿墙 —— 车在楼下、人在楼上，
+    /// 只要链路重连过一次，车就会被解开。所以留了「首个读数弱于 -85 就不开」的止损。
+    /// 觉得不安全的人可以关掉它，回到 RSSI 判据。
+    var connectUnlock: Bool {
+        get { return flag(StoreKey.connectUnlock, true) }
+        set { putFlag(StoreKey.connectUnlock, newValue) }
     }
 
     /// 指令通道模式（1.26）。默认智能：蓝牙优先，够不着转网络。
@@ -2807,6 +2850,8 @@ final class BleCentral: NSObject {
     /// 保活心跳：车机侧 10 秒内没有往来就断链路（实测 12 秒），
     /// 只靠被动收状态帧不够稳，主动 readRSSI 既保活又顺手更新距离。
     private var pingTimer: Timer?
+    /// 快速采样档（1.28）：等开锁的窗口里用 2 秒，其余 5 秒。
+    private var pingFast = false
     private var lastStatusFlags = ""
     /// 上一次的门位字节，用来判断门开关是否变化（日志只在变化时记一行）
     private var lastDoorByte: UInt8 = 0xFF
@@ -2855,13 +2900,31 @@ final class BleCentral: NSObject {
     private func startPing() {
         guard keepAlive, ready else { return }
         stopPing()
-        let t = Timer(timeInterval: 5.0, repeats: true) { [weak self] _ in
+        // 采样提速（1.28）：等开锁的窗口里 2 秒读一次，其余时间仍然是 5 秒。
+        //
+        // 5 秒是保活底线（车机 10 秒没往来就掐链路），不是判定需要的精度。
+        // 而判定要的是「人刚走到车边」那一下 —— 2 秒一读能把发现时间从
+        // 5~10 秒压到 2~4 秒；配合未平滑值，开锁提前十几秒。
+        // 只在「车锁着 + 蓝牙连着」时提速，开车走了或人走远了自动回 5 秒。
+        let iv = pingFast ? 2.0 : 5.0
+        let t = Timer(timeInterval: iv, repeats: true) { [weak self] _ in
             guard let self = self else { return }
             guard self.connected, let p = self.peripheral, p.state == .connected else { return }
             p.readRSSI()
         }
         RunLoop.main.add(t, forMode: .common)
         pingTimer = t
+    }
+
+    /// 快速采样开关。档位没变就不重启定时器 —— 这个方法每次判定都会调。
+    func setFastRssi(_ on: Bool) {
+        guard keepAlive, ready, pingFast != on else {
+            pingFast = on
+            return
+        }
+        pingFast = on
+        startPing()
+        log("· RSSI 采样切换：\(on ? "2 秒（等开锁）" : "5 秒（保活）")")
     }
 
     private func stopPing() {
@@ -3647,7 +3710,7 @@ final class AutoEngine: NSObject, ObservableObject {
     /// 参与了编译，界面上才会跟着变。
     ///
     /// 每次改源码就换一个值，装完瞄一眼底部就知道装的是哪一次构建。
-    static let buildTag = "b110a2"
+    static let buildTag = "b110a3"
 
     let ble = BleCentral()
     let api = CarAPI()
@@ -3692,6 +3755,8 @@ final class AutoEngine: NSObject, ObservableObject {
 
     /// 双通道竞速开关（界面绑定）
     @Published var raceEnabled = false
+    /// 连上即开（1.28，界面绑定）
+    @Published var connectUnlockEnabled = true
     /// 围栏降耗开关（界面绑定）
     @Published var fenceEnabled = false
     /// 通知与震动开关（界面绑定）
@@ -3737,6 +3802,13 @@ final class AutoEngine: NSObject, ObservableObject {
     private var lastRssiValue = -127
     private var lastRssiAt: Int64 = 0
     private var rssiSmooth = -127
+    /// 原始读数连续两拍走强（1.28）。判开锁的辅助信号：
+    /// 平滑值还在半分钟前的位置时，趋势已经能说明「人正在靠近」。
+    private var rssiTrendUp = false
+    private var rssiPrevRaw = -127
+    private var rssiPrevDelta = 0
+    /// 连上即开的等待令牌：连上后又断开、或已经用别的方式开过，就作废这一次。
+    private var connectUnlockToken = 0
     private var reconnectFails = 0
     private var nextReconnectAt: Int64 = 0
     /// 是否在后台。省电退避、轮询节流都要看它 —— 之前这里写死成「前台」，
@@ -3855,6 +3927,7 @@ final class AutoEngine: NSObject, ObservableObject {
         locBackground = store.locBg
         geoEnabled = store.geoOn
         raceEnabled = store.raceOn
+        connectUnlockEnabled = store.connectUnlock
         doorGuardEnabled = store.flag(StoreKey.doorGuard, true)
         fenceEnabled = store.fenceOn
         notifyEnabled = store.notifyEnabled
@@ -4128,6 +4201,10 @@ final class AutoEngine: NSObject, ObservableObject {
         }
         washText = wash ? "洗车模式 · 剩余 \(max(1, (store.washUntil - now) / 60000)) 分钟" : ""
 
+        // 等开锁的窗口里把采样提到 2 秒。开完锁（或车本来就是开的）立刻回 5 秒 ——
+        // 不能在车边整天 2 秒一次地读，那点电全花在这上面了。
+        ble.setFastRssi(running && ble.isConnected && armed && !st.unlockedThisVisit)
+
         // 判定全在 decideAction 里（1.25）：蓝牙优先，接不上才转定位。
         let act = wash ? Logic.NONE : decideAction(now: now, cfg: cfg)
         let src = geoActive ? "定位" : "蓝牙"
@@ -4234,7 +4311,7 @@ final class AutoEngine: NSObject, ObservableObject {
                 // 就是「-75 差 3dB 到不了 -72」，而不是一句「蓝牙已连接」。
                 let r = rssiSmooth
                 if r > -120 && r < store.cfg.thr {
-                    whyText = "信号 \(r)dBm 未达门限 \(store.cfg.thr)dBm · 正在用定位兜底"
+                    whyText = "信号 \(r)dBm 未达门限 \(store.cfg.thr)dBm · 再靠近一点，或等重连即开"
                 } else {
                     whyText = "蓝牙已连接 · 走远到 \(farM) 米外才会自动锁"
                 }
@@ -4333,20 +4410,33 @@ final class AutoEngine: NSObject, ObservableObject {
     /// 人走一步就是一轮。实测一天下来又热又卡。而它换来的精度其实没必要 ——
     /// 蓝牙 RSSI 判「在不在车旁」比 10 米 GPS 准得多。
     ///
-    /// 现在的三条规则：
-    /// 1. **蓝牙有可用信号**（连着、帧新鲜、RSSI ≥ -90）→ 只按蓝牙判开锁，
-    ///    并且**把定位整个停掉**。省电的全部来源就在这一条。
-    /// 2. **蓝牙没信号**（断开 / 连着但弱于 -90）→ 才拉起定位，粗档判距离：
-    ///    100 米外才锁车，10 米内兜底开锁。
-    /// 3. 两条路都沿用「本次到访」语义，避免一边开了锁另一边不知道又解开。
+    /// 现在的三条规则（1.28）：
+    /// 1. **蓝牙一连上** → 立刻下发开锁（「连上即开」，见 `unlockOnConnect`）。
+    /// 2. **蓝牙有可用信号**（连着、帧新鲜、RSSI ≥ 门限-6）→ 只按蓝牙判，
+    ///    用**未平滑**读数 + 上升趋势；并且**把定位整个停掉**。省电主要来源。
+    /// 3. **蓝牙没信号** → 才拉起定位，而且定位只干一件事：粗档判距离，
+    ///    超过 100 米才锁车。1.28 起定位不再参与开锁。
     private func decideAction(now: Int64, cfg: Logic.Cfg) -> Int {
         let gcfg = store.geoCfg
 
         let rssiFresh = lastRssiAt > 0 && (now - lastRssiAt) < Logic.RSSI_FRESH_MS
         st.rssiFresh = rssiFresh
-        let near = Logic.nearAssumeByLink(rssi: rssiSmooth, thr: cfg.thr,
-                                          fresh: rssiFresh, frameCount: recentFrameCount(now))
-        st.rssi = near && !rssiFresh ? cfg.thr : rssiSmooth
+        // ── 1.28：判开锁用**未平滑**的原始读数 ──
+        //
+        // 平滑公式是 (3×旧 + 新)/4，样本 5 秒一个，时间常数 17 秒。从 -80 爬到 -72
+        // 需要 6 个样本 = 30 秒。也就是说人已经贴在车门上，判定还在用半分钟前的
+        // 信号值 —— 这是「每天都罚站」最直接的一条。
+        // 判锁车仍然用平滑值（见下面 bu / farLock）：那边要的是稳，不是快。
+        let rawUsable = rssiFresh && lastRssiValue > -120
+        st.rssi = rawUsable ? lastRssiValue : rssiSmooth
+        st.rssiTrendUp = rssiTrendUp
+
+        // 完全读不到读数时退回「状态帧判近」：车机省电、刚回连时状态帧还在推，
+        // 人就在车边，只是没过 RSSI。
+        if !rssiFresh, Logic.nearAssumeByLink(rssi: st.rssi, thr: cfg.thr,
+                                              fresh: false, frameCount: recentFrameCount(now)) {
+            st.rssi = cfg.thr
+        }
 
         // 共享状态（visited / unlockedThisVisit / lastNearAt）必须一直维护，
         // 否则「走开再回来」的语义会丢。动作由下面的策略决定，不由它决定。
@@ -4360,37 +4450,35 @@ final class AutoEngine: NSObject, ObservableObject {
             return bleAct
         }
 
+        // ── 刚连上、还没读到第一个 RSSI：这一拍什么都不判 ──
+        // 否则会掉进「蓝牙不可用 → 拉定位 → 判是否该锁车」，在下发「连上即开」
+        // 之前先发一条锁车指令（acting 被占住，开锁反而被跳过）。
+        if ble.isConnected && lastRssiAt == 0 {
+            stopGeoForBle()
+            return bleAct == Logic.UNLOCK ? Logic.UNLOCK : Logic.NONE
+        }
+
         // 判「蓝牙可用」用的是宽松得多的窗口（60 秒），不是 RSSI 新鲜窗口（10 秒）。
         // 读不到读数不等于信号没了：iOS 后台会限流 readRSSI，拿 10 秒当断线
         // 会让定位反复启停，省下的电又全花回 GPS。
         let heldFresh = lastRssiAt > 0 && (now - lastRssiAt) < Logic.BLE_USABLE_HOLD_MS
         let bu = Logic.bleUsable(connected: ble.isConnected, rssiFresh: heldFresh,
                                  rssi: rssiSmooth, unlockThr: cfg.thr)
-        // 1.26：把「能开锁」和「能用」拆开。只有真正达到开锁门限才停定位，
-        // 否则 -78~-72 这段会变成黑洞：定位停了、开锁又不达标，人站在车门边干等。
-        let strong = Logic.bleStrong(connected: ble.isConnected, rssiFresh: rssiFresh,
-                                     rssi: rssiSmooth, unlockThr: cfg.thr)
 
-        if bu && strong {
-            // ── 贴着车：一个 GPS 点都不取 ──
+        if bu {
+            // ── 蓝牙够用（≥ 门限 - 6dB）：一个 GPS 点都不取 ──
+            //
+            // 1.28 删掉了「定位兜底开锁」，所以弱连接不再需要精细定位 ——
+            // 开锁与否全交给上面的 bleAct（未平滑值 + 上升趋势）。
+            // 地库里 GPS 本来也给不出 ±30 米的精度，那段兜底从来没真正生效过。
             stopGeoForBle()
+            // 蓝牙可用时绝不锁车：人可能就在车边，只是信号被口袋挡住。
+            // 之前这里直接 return bleAct，弱信号站久了会被判「离开 30 秒」而落锁。
             return bleAct == Logic.UNLOCK ? Logic.UNLOCK : Logic.NONE
         }
 
-        if bu && bleAct == Logic.UNLOCK {
-            // ── 信号不算强，但状态帧连着、RSSI 折算后达标：直接开，不必等定位 ──
-            stopGeoForBle()
-            return Logic.UNLOCK
-        }
-
-        // ── 弱连接（bu 但不够开锁）或已断开：交给定位 ──
-        // 弱连接时人在车边但信号被身体 / 口袋挡了，必须用精细档才可能过精度门槛；
-        // 完全断开才是「走远锁车」的场景，粗档足够而且省电。
-        if bu {
-            startGeoForNear()
-        } else {
-            startGeoForFar()
-        }
+        // ── 蓝牙不可用：定位只剩一件工作 —— 判「是否走远到该锁车」 ──
+        startGeoForFar()
         let g = buildGeo(now, cfg, gcfg)
         let ok = Geo.usable(g, gcfg)
         if geoActive != ok { geoActive = ok }
@@ -4404,25 +4492,9 @@ final class AutoEngine: NSObject, ObservableObject {
 
         geoSt = g
 
-        // 注意这里传 `bu` 而不是写死的 false：弱连接同样不许锁车 —— 人可能
-        // 就在车边打电话，只是信号被挡住了。1.25 那条分支只在 bu=false 时才会
-        // 走到，所以写死无碍；1.26 弱连接也会走到这里，写死就等于「信号一弱就锁」。
-        if Logic.farLockReady(bleUsable: bu, geoUsable: ok, dist: g.dist,
+        if Logic.farLockReady(bleUsable: false, geoUsable: ok, dist: g.dist,
                               farM: farM, awayLong: awayLong) {
             return Logic.LOCK
-        }
-
-        // 定位兜底开锁：蓝牙连不上或信号太弱，但人确实站在车边。
-        // 1.26 把精度门槛从 15 米放到 `accNearM`（默认 30）：
-        // 原来「15 米」和粗档定位（精度 65 米+）根本不可能同时成立，
-        // 这条兜底等于从来没生效过 —— 也是罚站的一大来源。
-        if ok, !g.dist.isNaN,
-           g.dist <= store.geoNearM, g.phoneAcc <= gcfg.accNearM,
-           store.autoUnlock,
-           armed, !st.moving, !st.unlockedThisVisit,
-           (now - lastUnlockAt) > cfg.unlockCooldownMs {
-            log("◇ 定位兜底开锁：距车 \(Int(g.dist.rounded())) 米，精度 ±\(Int(g.phoneAcc)) 米")
-            return Logic.UNLOCK
         }
 
         return Logic.NONE
@@ -4444,38 +4516,6 @@ final class AutoEngine: NSObject, ObservableObject {
         guard loc.running else { return }
         loc.stop()
         log("· 停掉定位（不再取 GPS 点）")
-    }
-
-    /// 蓝牙连着但信号不够开锁（-78~-72）时，拉起**精细**定位。
-    ///
-    /// 这条分支是 1.26 补的。1.25 只分「可用 / 不可用」：可用就停定位，
-    /// 于是信号在这 6dB 区间时既不取 GPS、又开不了锁 —— 人贴着车门站着，
-    /// App 一声不响。用户口中的「罚站」多半就是这一段。
-    ///
-    /// 用精细档而不是粗档：粗档精度 65 米起步，`Geo.usable` 都过不了，
-    /// 更别说拿它判「10 米内」。这段通常只持续几秒到几十秒（人正走到车边），
-    /// 多花的电有限。
-    private func startGeoForNear() {
-        guard running, store.geoOn else { return }
-        if loc.running {
-            // setMode 内部会去重，档位没变不会重启定位
-            loc.setMode(.fine)
-            return
-        }
-        guard loc.authorized else {
-            if !geoAskedThisSession {
-                geoAskedThisSession = true
-                loc.askPermission()
-                log("⚠︎ 蓝牙信号偏弱、定位没授权 → 只能等信号变强再开锁")
-            }
-            locText = loc.statusText
-            return
-        }
-        loc.setBackground(store.locBg)
-        loc.setMode(.fine)
-        loc.start()
-        locText = loc.statusText
-        log("▶ 蓝牙信号偏弱（\(rssiSmooth)dBm，门限 \(cfgThr)）→ 精细定位兜底开锁")
     }
 
     /// 门限的简写，只给日志用
@@ -4694,6 +4734,55 @@ final class AutoEngine: NSObject, ObservableObject {
     ///
     /// 现在它只做一件事：把判定往前推一拍，让 `decideAction` 去拉起定位。
     /// 门闸、冷却、行驶中这些检查都还在真正的 LOCK 分支里，一条没少。
+    /// 连上即开（1.28）。
+    ///
+    /// 为什么要有它：原来的判定要同时满足「链路建立 → 读到读数 → 读数过门限 →
+    /// 平滑值收敛」，每一步都吃掉几秒到几十秒，人站在车门前的体感就是 App 死了。
+    /// 这一条把等待全部省掉：**不等读数、不等状态帧、不等平滑**。
+    ///
+    /// 代价得说清楚：蓝牙能穿墙。人在家里、车在楼下，只要链路挂着，一次重连就会
+    /// 把车解开。所以留了 0.8 秒的止损 —— 连上后读到的第一个 RSSI 若弱于 -85
+    /// （穿两层墙的量级），这一次不开。贴车门时几乎不可能低于 -85。
+    private func unlockOnConnect() {
+        guard running, store.autoUnlock, store.connectUnlock,
+              store.chMode != Logic.MODE_NET else { return }
+        guard CarAPI.nowMs() >= store.washUntil else { return }
+        guard !acting, !ble.busy, !st.moving, !(car?.moving ?? false) else { return }
+        guard !st.unlockedThisVisit else { return }
+        // 已经知道车是开着的，就不要再发一条（幂等，但没必要）
+        if armedKnown, !armed { return }
+
+        connectUnlockToken += 1
+        let tk = connectUnlockToken
+        let t0 = CarAPI.nowMs()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+            guard let self = self, self.connectUnlockToken == tk, self.ble.isConnected else { return }
+            guard self.running, self.store.autoUnlock, self.store.connectUnlock else { return }
+            guard !self.acting, !self.st.unlockedThisVisit else { return }
+            let gotReading = self.lastRssiAt >= t0
+            if gotReading, self.lastRssiValue < Logic.CONNECT_MIN_RSSI {
+                self.log("· 连上即开：首个读数 \(self.lastRssiValue)dBm 弱于 \(Logic.CONNECT_MIN_RSSI) → 这次不开")
+                return
+            }
+            // 先占住「本次到访已开过」，防止链路抖动时反复下发
+            self.st.unlockedThisVisit = true
+            self.geoSt.unlockedThisVisit = true
+            self.log("▶ 连上即开：\(gotReading ? "\(self.lastRssiValue)dBm" : "还没读到 RSSI")，直接下发开锁")
+            self.requestAction(unlock: true, auto: true)
+        }
+    }
+
+    /// 开锁没成功 → 解除「本次到访已开过」。
+    ///
+    /// 1.28 起这个标记在「连上即开」时是**先占后发**的：占住是为了防抖动重发，
+    /// 但如果这一笔根本没成功，人就被永久关在门外了（车锁着、判定还说「开过了」）。
+    /// 所以失败要还回去，下一拍或下次连上还能再试。
+    private func clearVisitOnUnlockFail() {
+        st.unlockedThisVisit = false
+        geoSt.unlockedThisVisit = false
+        log("· 开锁未成功 → 解除本次到访限制，下次靠近或重连会再试")
+    }
+
     private func handleLinkLost() {
         guard running else { return }
         log("· 蓝牙断开 → 转定位判距（\(Int(Logic.farLockM(store.geoFarM))) 米外才锁）")
@@ -4709,7 +4798,7 @@ final class AutoEngine: NSObject, ObservableObject {
         if !running {
             text = ""
         } else if loc.running {
-            text = "定位兜底 · 蓝牙没信号，\(Int(Logic.farLockM(store.geoFarM))) 米外自动锁"
+            text = "定位判距 · 蓝牙没信号，\(Int(Logic.farLockM(store.geoFarM))) 米外自动锁"
         } else {
             text = "蓝牙优先 · 已连车机，不取 GPS"
         }
@@ -5045,6 +5134,15 @@ final class AutoEngine: NSObject, ObservableObject {
         store.raceOn = on
         raceEnabled = on
         log(on ? "双通道竞速：已开启" : "双通道竞速：已关闭（回到单通道优先逻辑）")
+    }
+
+    /// 连上即开（1.28）。关掉之后回到「RSSI 过门限才开」的老口径。
+    func setConnectUnlock(_ on: Bool) {
+        store.connectUnlock = on
+        connectUnlockEnabled = on
+        log(on
+            ? "连上即开：已开启（蓝牙一建立连接就下发开锁，不再等信号）"
+            : "连上即开：已关闭（回到 RSSI 门限判定，信号达标才开）")
     }
 
     /// 切换指令通道模式（1.26）。
@@ -5646,11 +5744,21 @@ extension AutoEngine: BleCentralDelegate {
             // 让 nearAssumeByLink 走"连上即视为在附近"那一支
             lastRssiAt = 0
             rssiSmooth = -127
+            rssiPrevRaw = -127
+            rssiPrevDelta = 0
+            rssiTrendUp = false
             ble.readRssi(force: true)
             evaluate("蓝牙已连接")
+            // 1.28：连上就开，不等 RSSI、不等状态帧。
+            unlockOnConnect()
         } else {
             rssi = -127
             rssiSmooth = -127
+            rssiPrevRaw = -127
+            rssiPrevDelta = 0
+            rssiTrendUp = false
+            // 断开了，还在等的那次「连上即开」作废
+            connectUnlockToken += 1
             // 断连之后门位就没有来源了，界面如实退回「未知」，
             // 不让上一次的「全关」一直挂在那里骗人
             doorShown = false
@@ -5688,18 +5796,25 @@ extension AutoEngine: BleCentralDelegate {
         rssi = r
         lastRssiValue = r
         lastRssiAt = CarAPI.nowMs()
+        // 趋势用**原始值**判：两拍累计涨 2dB 以上才算走强（单拍 +1dB 是噪声）。
+        // 平滑值在这里帮不上忙 —— 它正是那个慢 30 秒的东西。
+        let delta = rssiPrevRaw > -120 ? r - rssiPrevRaw : 0
+        rssiTrendUp = rssiPrevRaw > -120 && delta > 0 && (delta >= 2 || rssiPrevDelta > 0)
+        rssiPrevDelta = delta
+        rssiPrevRaw = r
         if rssiSmooth == -127 {
             rssiSmooth = r
         } else {
             rssiSmooth = (rssiSmooth * 3 + r) / 4
         }
-        // 1.26：门槛放到「开锁门限 - 6dB」，并且后台也判。
+        // 1.28：门槛判**原始值**，且把「差 4dB 但正在走强」也算进来。
         //
-        // 原来卡在 `>= thr`，且后台直接 return。结果：口袋挡住信号掉到 -75 时，
-        // 这个回调连判定都不触发，人走到车门边 App 一无所知 —— 这是罚站的另一半。
-        // 后台回调频率低，但有一次算一次，正是「锁屏揣兜里走过去」的现场。
+        // 原来卡平滑值 >= 门限，等于要求人在门口站半分钟等滤波收敛。
+        // 现在只要这一拍读数到位、或趋势说明正在靠近，就立刻跑一次判定。
         guard running else { return }
-        if rssiSmooth >= store.cfg.thr - Logic.BLE_REACH_SLACK_DB, armed, !st.unlockedThisVisit {
+        let thr = store.cfg.thr
+        if armed, !st.unlockedThisVisit,
+           r >= thr || (rssiTrendUp && r >= thr - Logic.TREND_SLACK_DB) {
             evaluate("信号转强")
         }
     }
@@ -5818,7 +5933,7 @@ extension AutoEngine: BleCentralDelegate {
                 if store.chMode == Logic.MODE_BLE {
                     log("✗ 蓝牙失败（\(msg)）· 仅蓝牙模式：不转网络，这一笔放弃")
                     lastResult = msg
-                    if !pendingUnlock { noteLockFailed(msg) }
+                    if pendingUnlock { clearVisitOnUnlockFail() } else { noteLockFailed(msg) }
                 } else if fallbackRound < 1 {
                     fallbackRound += 1
                     log("蓝牙失败（\(msg)），自动转网络")
@@ -5828,7 +5943,7 @@ extension AutoEngine: BleCentralDelegate {
                 } else {
                     log("✗ 蓝牙失败（\(msg)），两条通道都试过了")
                     lastResult = msg
-                    if !pendingUnlock { noteLockFailed(msg) }
+                    if pendingUnlock { clearVisitOnUnlockFail() } else { noteLockFailed(msg) }
                 }
             } else {
                 lastResult = msg
@@ -6550,7 +6665,7 @@ struct MainView: View {
                         Text("走远自动锁车")
                             .font(.system(size: 15, weight: .semibold))
                             .foregroundColor(UI.text)
-                        Text("蓝牙没信号、或信号弱到开不了锁时才用定位：\(Int(Logic.farLockM(Store.shared.geoFarM))) 米外锁车，\(Int(Store.shared.geoNearM)) 米内兜底开锁。信号够强时完全不取 GPS。")
+                        Text("定位只用来判「该不该锁车」：蓝牙没信号、且距离超过 \(Int(Logic.farLockM(Store.shared.geoFarM))) 米才锁。1.28 起定位不再参与开锁 —— 开锁全交给蓝牙。")
                             .font(.system(size: 11))
                             .foregroundColor(UI.dim)
                             .fixedSize(horizontal: false, vertical: true)
@@ -6666,6 +6781,12 @@ struct MainView: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
 
+                toggleRow("连上即开",
+                          "蓝牙一连上车机就下发开锁，不等信号强度、不等车机状态帧。治罚站最有效，"
+                          + "代价是蓝牙能穿墙：车在楼下、人在楼上，链路重连过一次也会开。"
+                          + "另有止损：连上后第一个读数弱于 -85dBm 就不开。",
+                          isOn: Binding(get: { e.connectUnlockEnabled }, set: { e.setConnectUnlock($0) }))
+
                 if e.chMode == Logic.MODE_SMART {
                     toggleRow("双通道竞速",
                               "开锁 / 锁车时蓝牙与网络同时下发，谁先回执算谁。两条都是幂等指令，不会多锁一次。",
@@ -6779,12 +6900,12 @@ struct MainView: View {
             VStack(alignment: .leading, spacing: 20) {
                 SectionTitle(text: "距离与延时")
 
-                SliderRow(title: "靠近门限",
+                SliderRow(title: "靠近门限（当前不参与开锁）",
                           unit: " 米",
                           value: $geoNear,
                           range: 5 ... 30,
                           step: 1,
-                          hint: "只在「蓝牙连不上或信号偏弱、但人确实站在车边」时用：定位距离小于它、且精度优于 30 米，才兜底开一次锁。蓝牙正常时完全不看这一项。")
+                          hint: "1.28 起定位不再参与开锁判定，这一项留着只是给旧逻辑备用。现在开锁只看蓝牙：要么「连上即开」，要么信号到门限。")
 
                 SliderRow(title: "开锁信号门限",
                           unit: " dBm",
