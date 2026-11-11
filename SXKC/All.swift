@@ -1231,6 +1231,24 @@ enum Logic {
         return awayLong
     }
 
+    /// 1.29：定位判远这条**捷径**能不能真的下发锁车。
+    ///
+    /// `decideAction` 在蓝牙不可用时用 farLockReady 直接返回 LOCK，不经过 `decide`。
+    /// 1.28 就是这样把「锁车成功之后还一直锁车」放出来的：人走远后
+    /// 「蓝牙断 / 距离够远 / 离开够久」永远成立，于是每拍都算出 LOCK，
+    /// 而 `decide` 里的 armed / visited / 冷却三道闸门全被绕过去了。
+    /// 这里把闸门补回来，做成纯函数，两端共用同一组单测向量。
+    static func allowFarLock(armedKnown: Bool, armed: Bool, lockedThisVisit: Bool,
+                             now: Int64, lastLockAt: Int64, cooldownMs: Int64) -> Bool {
+        // 本次到访已经发过锁车：哪怕车机还没回状态帧，也不再自动下发
+        if lockedThisVisit { return false }
+        // 锁态已知且车已经锁着
+        if armedKnown && armed { return false }
+        // 刚发过锁车，冷却期内不重复
+        if lastLockAt > 0 && (now - lastLockAt) < cooldownMs { return false }
+        return true
+    }
+
     /// 双通道并发之后，最多再重发几轮。每轮间隔 `VERIFY_WINDOW_MS`。
     /// 4 轮 ≈ 80 秒，足够覆盖地库、弱网、车机刚唤醒这几种慢响应。
     static let VERIFY_MAX_ROUNDS = 4
@@ -3710,7 +3728,7 @@ final class AutoEngine: NSObject, ObservableObject {
     /// 参与了编译，界面上才会跟着变。
     ///
     /// 每次改源码就换一个值，装完瞄一眼底部就知道装的是哪一次构建。
-    static let buildTag = "b110a3"
+    static let buildTag = "b110a4"
 
     let ble = BleCentral()
     let api = CarAPI()
@@ -3838,6 +3856,8 @@ final class AutoEngine: NSObject, ObservableObject {
     /// 本次「到访」是否已经发过锁车指令。
     /// 一次到访只锁一次，不能因为车机抖动反复下发。
     private var lockedForThisVisit = false
+    /// 1.29：闸门挡住重复锁车时只打一条日志，别每拍刷屏
+    private var lockSuppressLogged = false
     /// 最近一次发出的动作是不是开锁；回执核实用它判断「意图有没有被反向覆盖」
     private var lastActionUnlock = false
 
@@ -4094,6 +4114,7 @@ final class AutoEngine: NSObject, ObservableObject {
         st.lastNearAt = 0
         geoSt = Geo.St()
         lockedForThisVisit = false
+        lockSuppressLogged = false
         reconnectToken += 1          // 作废挂着的那次断线重试
         reconnectFails = 0
         nextReconnectAt = 0
@@ -4137,6 +4158,7 @@ final class AutoEngine: NSObject, ObservableObject {
         lastResult = ""
         car = nil
         lockedForThisVisit = false
+        lockSuppressLogged = false
         api.uid = ""
         api.ssk = ""
         api.tid = ""
@@ -4441,6 +4463,12 @@ final class AutoEngine: NSObject, ObservableObject {
         // 共享状态（visited / unlockedThisVisit / lastNearAt）必须一直维护，
         // 否则「走开再回来」的语义会丢。动作由下面的策略决定，不由它决定。
         let bleAct = Logic.decide(&st, cfg)
+        // 1.29：这一拍判近 = 人回到车边 = 新的一次到访，解除「本次已锁过」的抑制。
+        // 锁车成功那一拍 lastNearAt 还是上一次判近的旧值，不会把闸门误清掉。
+        if st.lastNearAt == now {
+            lockedForThisVisit = false
+            lockSuppressLogged = false
+        }
 
         // ── 仅蓝牙模式：定位完全不参与 ──
         // 用户选「纯蓝牙」要的就是：不取 GPS、不发网络。判定全交给 RSSI 与状态帧，
@@ -4494,6 +4522,20 @@ final class AutoEngine: NSObject, ObservableObject {
 
         if Logic.farLockReady(bleUsable: false, geoUsable: ok, dist: g.dist,
                               farM: farM, awayLong: awayLong) {
+            // 1.29：这条捷径不经过 decide，必须自己把闸门补齐。否则锁车成功后
+            // 条件依旧成立，每一拍都会再下发一条锁车（本次到访已锁过 / 车已锁 /
+            // 冷却期内，三种情况都不该再发）。
+            guard Logic.allowFarLock(armedKnown: armedKnown, armed: armed,
+                                     lockedThisVisit: lockedForThisVisit,
+                                     now: now, lastLockAt: lastLockAt,
+                                     cooldownMs: cfg.lockCooldownMs) else {
+                if !lockSuppressLogged {
+                    lockSuppressLogged = true
+                    log("· 本次到访已锁过（或车已锁 / 冷却中）→ 不再重复下发锁车")
+                }
+                return Logic.NONE
+            }
+            lockSuppressLogged = false
             return Logic.LOCK
         }
 
@@ -5471,15 +5513,16 @@ final class AutoEngine: NSObject, ObservableObject {
                     netUnconfirmed = true
                     log("⚠ 已重发 \(Logic.VERIFY_MAX_ROUNDS) 轮，车机仍未确认\(wasUnlock ? "开锁" : "锁车")")
                     if !wasUnlock {
-                        if autoLockFails < 3 {
-                            autoLockFails += 1
-                            autoLockRetryAt = now + 45000
-                            log("↻ 45 秒后再试一次自动锁车（第 \(autoLockFails)/3 次）")
-                        }
+                        // 1.29：不再叠加「45 秒后再锁 3 次」。本次到访的锁车指令
+                        // 已经发过 4 轮，车要么已经锁上（只是状态帧没回来），要么
+                        // 链路确实不通 —— 再发既锁不上车，又刷通知、耗流量。
+                        // 如实报「未确认」并通知用户手动核对，比闷头重发安全。
+                        autoLockFails = 0
+                        autoLockRetryAt = 0
                         if store.notifyEnabled {
                             Notify.shared.lockUnconfirmed(distText: notifyDistText())
                         }
-                        whyText = "⚠ 锁车没能确认，45 秒后重试"
+                        whyText = "⚠ 锁车没能确认，请手动核对车锁"
                     } else {
                         whyText = "⚠ 开锁没能确认，车可能还锁着"
                     }
