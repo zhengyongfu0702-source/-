@@ -42,6 +42,8 @@ targets:
       - path: SXKC/Assets.xcassets
     dependencies:
       - target: SXKCWidget
+      # 1.34：内置地图。MapKit 是系统框架，显式列一下，免得无签名构建时漏链
+      - sdk: MapKit.framework
     entitlements:
       path: SXKC/SXKC.entitlements
       properties:
@@ -52,8 +54,8 @@ targets:
       properties:
         CFBundleDisplayName: 五菱控车
         CFBundleName: SXKC
-        CFBundleShortVersionString: "1.32"
-        CFBundleVersion: "32"
+        CFBundleShortVersionString: "1.34"
+        CFBundleVersion: "34"
         CFBundleDevelopmentRegion: zh_CN
         LSRequiresIPhoneOS: true
         UILaunchScreen: {}
@@ -83,8 +85,8 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: cn.sxkc.lite
         PRODUCT_NAME: SXKC
         TARGETED_DEVICE_FAMILY: "1"
-        MARKETING_VERSION: "1.32"
-        CURRENT_PROJECT_VERSION: "32"
+        MARKETING_VERSION: "1.34"
+        CURRENT_PROJECT_VERSION: "34"
         GENERATE_INFOPLIST_FILE: NO
         SWIFT_OPTIMIZATION_LEVEL: "-O"
         ASSETCATALOG_COMPILER_APPICON_NAME: "AppIcon"
@@ -105,8 +107,8 @@ targets:
       path: SXKC/SXKCWidgetInfo.plist
       properties:
         CFBundleDisplayName: 五菱控车小组件
-        CFBundleShortVersionString: "1.32"
-        CFBundleVersion: "32"
+        CFBundleShortVersionString: "1.34"
+        CFBundleVersion: "34"
         NSExtension:
           NSExtensionPointIdentifier: com.apple.widgetkit-extension
     settings:
