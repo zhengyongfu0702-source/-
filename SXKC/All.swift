@@ -21,6 +21,7 @@ import CoreBluetooth
 import Combine
 import WidgetKit
 import SwiftUI
+import MapKit
 
 
 // ==========================================================================
@@ -1765,6 +1766,11 @@ enum StoreKey {
     static let amapKey = "amap_key"
 }
 
+/// 1.33：内置的高德 Web 服务 key。用户不需要填，开箱就能显示地名。
+/// 万一以后要换，在设置卡最底下连点版本号两下（长按）会展开输入框，
+/// 填了就以填的为准，清空就退回这个默认值。
+let kDefaultAmapKey = "f5f737c3a5928dd41f62c81221e04026"
+
 final class Store {
 
     static let shared = Store()
@@ -1808,6 +1814,19 @@ final class Store {
 
     func putLng(_ k: String, _ v: Int64) {
         d.set(Double(v), forKey: k)
+    }
+
+    /// 1.33：高德 key 的实际取值。用户填过就用填的，没填过（或清空了）用内置的。
+    ///
+    /// 统一从这里取，免得 resolvePlace 和设置界面各自判断一遍、结果不一致。
+    var amapKey: String {
+        let custom = str(StoreKey.amapKey).trimmingCharacters(in: .whitespacesAndNewlines)
+        return custom.isEmpty ? kDefaultAmapKey : custom
+    }
+
+    /// 是否用了内置 key（设置界面要靠它显示「已内置 / 已自定义」）
+    var amapKeyIsBuiltin: Bool {
+        return str(StoreKey.amapKey).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     func saveSession(tid: String, btkey: String, devName: String, expire: Int64) {
@@ -3813,7 +3832,7 @@ final class AutoEngine: NSObject, ObservableObject {
     /// 参与了编译，界面上才会跟着变。
     ///
     /// 每次改源码就换一个值，装完瞄一眼底部就知道装的是哪一次构建。
-    static let buildTag = "b110a7"
+    static let buildTag = "b110a9"
 
     let ble = BleCentral()
     let api = CarAPI()
@@ -3887,6 +3906,8 @@ final class AutoEngine: NSObject, ObservableObject {
     private var placeAt: Int64 = 0
     private var placeLat = 0.0
     private var placeLng = 0.0
+    /// 1.33：改 key 后的防抖任务，见 `resetPlaceCache()`
+    private var placeReloadWork: DispatchWorkItem?
     /// 是否已经拿到过有效状态字（决定文案用灰还是上色）
     @Published var vehStateShown = false
     /// 自动刷新状态开关（1.30，界面绑定）。只在前台跑，进后台自动停。
@@ -5825,7 +5846,8 @@ final class AutoEngine: NSObject, ObservableObject {
     /// 三条约束：没有 key 不请求；同一点位 5 分钟内不重复请求；失败保持上一次的名字，
     /// 不要把界面清空 —— 用户看到"定位中"闪来闪去比看到一个稍旧的地名更烦。
     private func resolvePlace(_ c: CarAPI.Car) {
-        let key = store.str(StoreKey.amapKey)
+        // 1.33：key 从 Store 统一取 —— 用户没填过时返回内置 key，所以默认就能显示地名。
+        let key = store.amapKey
         guard !key.isEmpty else { return }
         guard let lat = Double(c.lat), let lng = Double(c.lng), lat != 0, lng != 0 else { return }
         let now = CarAPI.nowMs()
@@ -5852,6 +5874,22 @@ final class AutoEngine: NSObject, ObservableObject {
                 self.placeText = addr
             }
         }.resume()
+    }
+
+    /// 1.33：改了高德 key 之后清掉「同一点位 5 分钟内不重复请求」的缓存。
+    ///
+    /// 输入框是逐字符回调的，这里必须防抖 —— 直接每次刷新会变成敲 32 下打 32 条请求。
+    /// 停手 1.5 秒才真正查一次，结果跟手，又不会把免费配额刷掉。
+    func resetPlaceCache() {
+        placeAt = 0
+        placeLat = 0
+        placeLng = 0
+        placeReloadWork?.cancel()
+        let w = DispatchWorkItem { [weak self] in
+            self?.refreshStatus()
+        }
+        placeReloadWork = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: w)
     }
 
     // MARK: 状态刷新
@@ -6809,6 +6847,10 @@ struct MainView: View {
     /// 同一个视图上挂两个 .sheet，在 iOS 14 上只有第一个会生效。
     /// 所以这里用一个可选的枚举统一驱动，而不是两个 isPresented。
     @State private var sheet: SheetKind?
+    /// 1.33：高德 key 的隐藏入口。长按设置卡最底下的版本号才展开。
+    @State private var showAmapKey = false
+    /// 1.34：状态卡里的内置地图是否展开
+    @State private var showMap = false
 
     private enum SheetKind: Int, Identifiable {
         case diag, cards
@@ -6924,6 +6966,31 @@ struct MainView: View {
 
     // MARK: 状态
 
+    /// 1.33：手里有没有可用的车辆坐标。
+    private var hasCoord: Bool {
+        return carCoord != nil
+    }
+
+    /// 1.34：把坐标解出来一次，供地图与跳转共用
+    private var carCoord: (lat: Double, lng: Double)? {
+        guard let c = e.car, let lat = Double(c.lat), let lng = Double(c.lng),
+              lat != 0, lng != 0 else { return nil }
+        return (lat, lng)
+    }
+
+    /// 1.34：点地名展开 / 收起**内置地图**。
+    ///
+    /// 之前是跳高德 / 苹果地图，用户明确说不想跳到别的软件，改成在 App 内展开。
+    /// 这里只切状态，真正的地图视图在状态卡里，视野由 CarMapView 管。
+    private func toggleMap() {
+        guard hasCoord else {
+            e.log("⚠ 还没有车辆坐标，先点一次刷新")
+            return
+        }
+        withAnimation { showMap.toggle() }
+        e.log(showMap ? "▶ 展开内置地图" : "· 收起内置地图")
+    }
+
     private var statusCard: some View {
         Card {
             VStack(alignment: .leading, spacing: 14) {
@@ -6983,17 +7050,41 @@ struct MainView: View {
                 }
 
                 // 1.32：车辆所在地名。没填高德 key、或还没解析出来时，整行不显示。
-                if !e.placeText.isEmpty {
-                    HStack(spacing: 6) {
-                        Image(systemName: "mappin.and.ellipse")
-                            .font(.system(size: 11))
-                            .foregroundColor(UI.dim)
-                        Text(e.placeText)
-                            .font(.system(size: 12))
-                            .foregroundColor(UI.dim)
-                            .lineLimit(1)
-                        Spacer(minLength: 0)
+                // 1.33：整行可点 —— 直接跳到地图看车在哪。右侧给个小箭头，免得看不出来能点。
+                // 1.34：不再跳外部 App，改成在下面展开 App 内置的地图。
+                // 地名还没解析出来（没网 / 配额用完）时退成「查看车辆位置」，
+                // 只要拿到过坐标就仍然能展开地图，不让这个入口依赖高德。
+                if !e.placeText.isEmpty || hasCoord {
+                    Button(action: { toggleMap() }) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "mappin.and.ellipse")
+                                .font(.system(size: 11))
+                                .foregroundColor(e.placeText.isEmpty ? UI.dim : UI.accent)
+                            Text(e.placeText.isEmpty ? "查看车辆位置" : e.placeText)
+                                .font(.system(size: 12))
+                                .foregroundColor(UI.dim)
+                                .lineLimit(1)
+                            Spacer(minLength: 0)
+                            Image(systemName: showMap ? "chevron.up" : "chevron.down")
+                                .font(.system(size: 11))
+                                .foregroundColor(UI.dim.opacity(0.7))
+                        }
+                        .contentShape(Rectangle())
                     }
+                    .buttonStyle(PlainButtonStyle())
+                }
+
+                // 1.34：内置地图。系统 MapKit，不跳外部 App，也不需要任何 key。
+                if showMap, let p = carCoord {
+                    CarMapView(lat: p.lat, lng: p.lng,
+                               title: e.placeText.isEmpty ? "车辆位置" : e.placeText)
+                        .frame(height: 200)
+                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .stroke(UI.line, lineWidth: 1)
+                        )
+                        .padding(.top, 2)
                 }
 
                 // 门位已并到标题行右侧的徽标里（1.30），这里不再单独占一行
@@ -7227,27 +7318,37 @@ struct MainView: View {
                           isOn: Binding(get: { e.autoRefreshEnabled },
                                         set: { e.setAutoRefresh($0) }))
 
-                // 1.32：高德 key。填了状态卡才显示地名，不填就完全不发这条请求。
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack(spacing: 8) {
-                        Text("高德 Key")
-                            .font(.system(size: 14, weight: .medium))
-                            .foregroundColor(UI.text)
-                        Spacer(minLength: 8)
-                        TextField("填了才显示地名", text: Binding(
+                // 1.33：高德 key 改成内置 + 隐藏入口。
+                // 内置 key 已经能显示地名，日常不需要看见这一行；长按最底下的版本号才展开。
+                // 展开后填了就以填的为准，清空就退回内置值。
+                if showAmapKey {
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 8) {
+                            Text("高德 Key")
+                                .font(.system(size: 14, weight: .medium))
+                                .foregroundColor(UI.text)
+                            Spacer(minLength: 8)
+                            Text(Store.shared.amapKeyIsBuiltin ? "内置" : "已自定义")
+                                .font(.system(size: 11))
+                                .foregroundColor(Store.shared.amapKeyIsBuiltin ? UI.dim : UI.ok)
+                        }
+                        TextField("留空使用内置 key", text: Binding(
                             get: { Store.shared.str(StoreKey.amapKey) },
-                            set: { Store.shared.put(StoreKey.amapKey, $0) }))
+                            set: {
+                                Store.shared.put(StoreKey.amapKey, $0)
+                                e.resetPlaceCache()
+                            }))
                             .font(.system(size: 12))
                             .multilineTextAlignment(.trailing)
                             .foregroundColor(UI.dim)
                             // iOS 14 兼容：不能用 textInputAutocapitalization（15+）
                             .autocapitalization(.none)
                             .disableAutocorrection(true)
+                        Text("只用于「经纬度 → 地名」，不上传任何车辆信息。清空这一栏就恢复内置 key。")
+                            .font(.system(size: 11))
+                            .foregroundColor(UI.dim)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
-                    Text("用高德开放平台的 Web 服务 key，只做「经纬度 → 地名」，不上传任何车辆信息。")
-                        .font(.system(size: 11))
-                        .foregroundColor(UI.dim)
-                        .fixedSize(horizontal: false, vertical: true)
                 }
 
                 // 指令通道（1.26）：用户要的「纯蓝牙 / 自由选择 / 一起共用」。
@@ -7529,6 +7630,15 @@ struct MainView: View {
                 Text(MainView.versionText)
                     .font(.system(size: 11))
                     .foregroundColor(UI.dim.opacity(0.8))
+                    // 1.33：隐藏入口。长按 1.2 秒展开 / 收起「高德 Key」。
+                    // 平时不显示，避免设置页被一串 32 位字符占着。
+                    .onLongPressGesture(minimumDuration: 1.2) {
+                        withAnimation { showAmapKey.toggle() }
+                        if !showAmapKey { UIApplication.shared.sendAction(
+                            #selector(UIResponder.resignFirstResponder),
+                            to: nil, from: nil, for: nil) }
+                    }
+                    .contentShape(Rectangle())
             }
         }
         .actionSheet(isPresented: $showLogout) {
@@ -7541,6 +7651,68 @@ struct MainView: View {
                     .cancel(Text("取消"))
                 ]
             )
+        }
+    }
+}
+
+// MARK: - 内置地图（1.34）
+
+/// App 内嵌的地图，用系统的 MapKit —— 不跳任何外部 App，也不需要额外 key。
+///
+/// 为什么不上高德 SDK：那要另申请「iOS 平台 Key」并绑定 bundle id，还要把
+/// 几十兆的 framework 塞进无签名构建。系统地图在中国大陆用的本来就是高德
+/// 数据、坐标系也是 GCJ-02，和车机返回的经纬度同一套 —— 不用做任何偏移
+/// 转换，图钉落点就是准的。
+struct CarMapView: UIViewRepresentable {
+
+    let lat: Double
+    let lng: Double
+    let title: String
+
+    final class Coord {
+        var lastLat = 0.0
+        var lastLng = 0.0
+    }
+
+    func makeCoordinator() -> Coord {
+        return Coord()
+    }
+
+    func makeUIView(context: Context) -> MKMapView {
+        let mv = MKMapView()
+        mv.isZoomEnabled = true
+        mv.isScrollEnabled = true
+        mv.isRotateEnabled = false
+        mv.isPitchEnabled = false
+        mv.showsCompass = false
+        mv.showsUserLocation = false
+        // 只留路网与地名，去掉商铺图标：这块只有 200 高，信息越少越好认
+        mv.pointOfInterestFilter = .excludingAll
+        return mv
+    }
+
+    func updateUIView(_ mv: MKMapView, context: Context) {
+        let moved = abs(lat - context.coordinator.lastLat) > 0.0001
+            || abs(lng - context.coordinator.lastLng) > 0.0001
+        // 车没动就不碰视野：用户刚把地图拖开看周边，下一次状态刷新不能把他拽回原点
+        guard moved || mv.annotations.isEmpty else { return }
+        context.coordinator.lastLat = lat
+        context.coordinator.lastLng = lng
+        let c = CLLocationCoordinate2D(latitude: lat, longitude: lng)
+        if let a = mv.annotations.first as? MKPointAnnotation {
+            a.coordinate = c
+            a.title = title
+        } else {
+            let a = MKPointAnnotation()
+            a.coordinate = c
+            a.title = title
+            mv.addAnnotation(a)
+        }
+        if moved || mv.region.span.latitudeDelta == 0 {
+            mv.setRegion(MKCoordinateRegion(center: c,
+                                            latitudinalMeters: 500,
+                                            longitudinalMeters: 500),
+                         animated: false)
         }
     }
 }
