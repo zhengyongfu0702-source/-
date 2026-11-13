@@ -1249,6 +1249,39 @@ enum Logic {
         return true
     }
 
+    // MARK: 车辆电源状态（1.30）
+
+    /// 熄火
+    static let VS_OFF = 0
+    /// ACC 通电（钥匙拧到 ACC，发动机没转）
+    static let VS_ACC = 1
+    /// 发动机已启动 / 原地怠速
+    static let VS_ENGINE = 2
+    /// 行驶中
+    static let VS_RUNNING = 3
+
+    /// 车辆当前是「熄火 / ACC 通电 / 已启动 / 行驶中」哪一档。
+    ///
+    /// 判定顺序不能反：行驶时 ACC 与启动位一定都是 1，
+    /// 先看车速才能把「行驶」和「原地怠速」分开。
+    /// 与安卓 `Logic.vehicleState` 同语义，供双端共用向量测试。
+    static func vehicleState(speedKph: Int, acc: Bool, eng: Bool) -> Int {
+        if speedKph > 0 { return VS_RUNNING }
+        if eng { return VS_ENGINE }
+        if acc { return VS_ACC }
+        return VS_OFF
+    }
+
+    /// 状态文案。没拿到 vst 时调用方显示「—」，不要用这个函数硬报「熄火」。
+    static func vehicleStateText(speedKph: Int, acc: Bool, eng: Bool) -> String {
+        switch vehicleState(speedKph: speedKph, acc: acc, eng: eng) {
+        case VS_RUNNING: return "行驶中"
+        case VS_ENGINE:  return "已启动"
+        case VS_ACC:     return "ACC 通电"
+        default:         return "熄火"
+        }
+    }
+
     /// 双通道并发之后，最多再重发几轮。每轮间隔 `VERIFY_WINDOW_MS`。
     /// 4 轮 ≈ 80 秒，足够覆盖地库、弱网、车机刚唤醒这几种慢响应。
     static let VERIFY_MAX_ROUNDS = 4
@@ -1726,6 +1759,10 @@ enum StoreKey {
     static let notifyOn = "notify_on"
     /// 门没关严不落锁（门位未确认前恒不生效）
     static let doorGuard = "door_guard"
+    /// 自动刷新车辆状态（1.30）：前台每 60 秒查一次，进后台自动停
+    static let autoRefresh = "auto_refresh"
+    /// 1.32：高德 Web 服务 key，只用来把经纬度翻成地名
+    static let amapKey = "amap_key"
 }
 
 final class Store {
@@ -1918,6 +1955,15 @@ final class Store {
         set { putFlag(StoreKey.connectUnlock, newValue) }
     }
 
+    /// 自动刷新车辆状态（1.30）。默认开。
+    ///
+    /// 只在**前台**跑：iOS 进后台后 Timer 必被挂起，写「后台也刷新」是骗人的。
+    /// 蓝牙连着时状态帧 3 秒一帧，本身就在刷新，这条会跳过、不额外发网络请求。
+    var autoRefresh: Bool {
+        get { return flag(StoreKey.autoRefresh, true) }
+        set { putFlag(StoreKey.autoRefresh, newValue) }
+    }
+
     /// 指令通道模式（1.26）。默认智能：蓝牙优先，够不着转网络。
     ///
     /// 用户明确要求能自己选：「纯蓝牙使用」「网络和蓝牙自由选择、也能一起共用」。
@@ -2018,6 +2064,20 @@ final class Notify: NSObject {
         // 不设 sound：锁车是"应该发生的事"，出声反而吵
         c.sound = nil
         post(id: "sxkc.auto.locked", content: c)
+        return true
+    }
+
+    /// 小电池电压偏低（1.32）。
+    ///
+    /// 不带「点这里做什么」：这不是能远程解决的事，推它是为了让人下次上车前有准备，
+    /// 别在停车场才发现打不着火。冷却 6 小时由调用方控制。
+    @discardableResult
+    func batteryLow(volt: Double) -> Bool {
+        let c = UNMutableNotificationContent()
+        c.title = "小电池电压偏低"
+        c.body = String(format: "当前 %.1fV，低于 10.8V。长时间停放可能打不着火，建议着车充一会儿。", volt)
+        c.sound = .default
+        post(id: "sxkc.battery.low", content: c)
         return true
     }
 
@@ -2298,6 +2358,9 @@ final class CarAPI {
 
     static let CODE_LOGIN = "10001003"
     static let CODE_STATUS = "203100"
+    /// 1.32：让车机立刻上报一次。原版「更新状态」，无参数。
+    /// 和 203100 的区别：203100 读的是平台缓存，这条是叫醒车机现报。
+    static let CODE_REPORT_NOW = "303505"
     static let CODE_LOCK = "303110"
     static let CODE_UNLOCK = "303115"
     /// 一键启动 / 熄火。实车抓包得来：303120 = 启动，303125 = 熄火
@@ -2470,6 +2533,8 @@ final class CarAPI {
 
     func lock() throws -> Resp { return try send(CarAPI.CODE_LOCK) }
     func unlock() throws -> Resp { return try send(CarAPI.CODE_UNLOCK) }
+    /// 让车机立刻上报。失败不抛给界面 —— 手动刷新本来就是「尽力而为」。
+    func reportNow() throws -> Resp { return try send(CarAPI.CODE_REPORT_NOW) }
     /// 一键启动（远程着车）。走网络，不需要蓝牙在附近。
     func startEngine() throws -> Resp { return try send(CarAPI.CODE_START) }
     /// 熄火
@@ -2550,6 +2615,8 @@ final class CarAPI {
 
     private static func finish(_ c: inout Car, _ fetchedAt: Int64) {
         c.armed = armedOfVst(c.vst)
+        c.acc = bitOfVst(c.vst, 0x08)
+        c.eng = bitOfVst(c.vst, 0x10)
         c.speedKph = Int(parseLong(c.speed, 0))
         c.moving = c.speedKph > 0
         c.reportedAt = c.tdt > 0 ? c.tdt * 1000 : fetchedAt
@@ -2561,8 +2628,22 @@ final class CarAPI {
     /// 实测：停车未锁 `000001C0…`、停车已锁 `000021C0…`、行驶中 `000018A0…`。
     /// 行驶态该位为 0，所以"未设防"不代表"车一定停着"，调用方必须自己排除行驶。
     static func armedOfVst(_ vst: String) -> Bool {
+        return bitOfVst(vst, 0x20)
+    }
+
+    /// vst 状态字节取某一位。第 3 个字节（索引 2）是状态字节：
+    ///
+    ///     0x08 ACC 通电   0x10 发动机启动   0x20 已设防（已锁）
+    ///
+    /// 三个实测样本互相印证：停车未锁 `000001C0`（b[2]=0x01，三位全 0）、
+    /// 停车已锁 `000021C0`（b[2]=0x21，只有 0x20）、
+    /// 行驶中 `000018A0`（b[2]=0x18，ACC 与启动同时置位）。
+    ///
+    /// 「ACC 通电但没启动」这一档目前没有实车样本，属按位定义推断 ——
+    /// 界面上如实标「ACC 通电」，不硬报「已启动」。
+    static func bitOfVst(_ vst: String, _ mask: UInt8) -> Bool {
         let b = Hex.to(vst)
-        return b.count > 2 && (b[2] & 0x20) != 0
+        return b.count > 2 && (b[2] & mask) != 0
     }
 
     static func parseLong(_ s: String, _ def: Int64) -> Int64 {
@@ -2584,6 +2665,10 @@ final class CarAPI {
         var reportedAt: Int64 = 0
         var moving = false
         var armed = false
+        /// 1.30：vst 第 3 字节 0x08 位 = ACC 通电
+        var acc = false
+        /// 1.30：vst 第 3 字节 0x10 位 = 发动机已启动
+        var eng = false
         var fetchedAt: Int64 = 0
     }
 }
@@ -3728,7 +3813,7 @@ final class AutoEngine: NSObject, ObservableObject {
     /// 参与了编译，界面上才会跟着变。
     ///
     /// 每次改源码就换一个值，装完瞄一眼底部就知道装的是哪一次构建。
-    static let buildTag = "b110a4"
+    static let buildTag = "b110a7"
 
     let ble = BleCentral()
     let api = CarAPI()
@@ -3794,6 +3879,18 @@ final class AutoEngine: NSObject, ObservableObject {
     @Published var doorShown = false
     /// 门或尾箱正开着（决定文案用橙色告警）
     @Published var doorAlert = false
+    /// 车辆电源状态（1.30）：行驶中 / 已启动 / ACC 通电 / 熄火。
+    /// 没拿到过状态时是「—」，不硬报「熄火」——那会在车其实启动着的时候骗人。
+    @Published var vehStateText = "—"
+    /// 1.32：车辆所在地名（高德逆地理）。没填 key 时一直是空串，界面就不显示这一行。
+    @Published var placeText = ""
+    private var placeAt: Int64 = 0
+    private var placeLat = 0.0
+    private var placeLng = 0.0
+    /// 是否已经拿到过有效状态字（决定文案用灰还是上色）
+    @Published var vehStateShown = false
+    /// 自动刷新状态开关（1.30，界面绑定）。只在前台跑，进后台自动停。
+    @Published var autoRefreshEnabled = true
 
     // 诊断页
     @Published var diagDevices: [DiagDevice] = []
@@ -3825,6 +3922,15 @@ final class AutoEngine: NSObject, ObservableObject {
     private var rssiTrendUp = false
     private var rssiPrevRaw = -127
     private var rssiPrevDelta = 0
+    /// 蓝牙状态帧解出来的电源位（1.30）。车速只有网络才有，所以蓝牙这一路
+    /// 先记 acc/eng，文案再和最近一次网络车速合并判断。
+    private var bleAcc = false
+    private var bleEng = false
+    /// 自动刷新定时器。iOS 进后台必被挂起，所以它是「前台才有」的。
+    private var autoRefreshTimer: Timer?
+    /// 断连后那次「查状态 → 必要时锁车」的去重时刻。
+    /// 链路抖动时断开/连上会来回好几次，不去重就会连发好几条查询。
+    private var linkLostQueryAt: Int64 = 0
     /// 连上即开的等待令牌：连上后又断开、或已经用别的方式开过，就作废这一次。
     private var connectUnlockToken = 0
     private var reconnectFails = 0
@@ -3841,6 +3947,19 @@ final class AutoEngine: NSObject, ObservableObject {
     private var autoLockRetryAt: Int64 = 0
     /// 这一轮自动锁车已经失败几次（最多 3 次就停手，交给用户手动锁）
     private var autoLockFails = 0
+
+    // MARK: 开锁后 10 分钟守夜（1.32）
+    //
+    // 用户要的边界很明确：开锁后 600 秒没开门，
+    //   · 蓝牙还连着 → 不回锁（人可能就在车边，锁了会把人锁在外面）
+    //   · 蓝牙已经断了 → 按「断开就锁」的既有规则处理
+    // 所以这里只当一个计时器，不自己发明锁车条件。
+    private var unlockWatchAt: Int64 = 0
+    private var unlockDoorSeen = false
+    private var unlockWatchDone = false
+    private var unlockWatchTimer: Timer?
+    /// 低电压提醒的冷却：6 小时内最多一条，停车时别反复弹
+    private var lastBatteryNotifyAt: Int64 = 0
     /// 本次指令是不是用户手动点的。手动失败不自动重试，避免和用户抢方向盘
     private var pendingManual = false
     /// 这条指令在「网络 ↔ 蓝牙」之间已经互转了几次。最多一次，
@@ -4095,6 +4214,7 @@ final class AutoEngine: NSObject, ObservableObject {
         // 注意：这里**不再**预启动定位。1.25 起定位只在「蓝牙没信号」时才拉起，
         // 由 decideAction 按需启停。启动时先连蓝牙，连上就一分钱定位电都不花。
         ble.ensureConnected()
+        startAutoRefresh()
     }
 
     func stop() {
@@ -4120,7 +4240,10 @@ final class AutoEngine: NSObject, ObservableObject {
         nextReconnectAt = 0
         autoLockRetryAt = 0
         autoLockFails = 0
+        // 1.32：关掉自动模式，开锁守夜也一并收掉，否则 10 分钟后还会去查一次
+        stopUnlockWatch()
         loc.stop()
+        stopAutoRefresh()
         geoActive = false
         distText = ""
         log("■ 自动模式关闭")
@@ -4829,6 +4952,51 @@ final class AutoEngine: NSObject, ObservableObject {
         guard running else { return }
         log("· 蓝牙断开 → 转定位判距（\(Int(Logic.farLockM(store.geoFarM))) 米外才锁）")
         evaluate("蓝牙断开")
+        queryAfterLinkLost()
+    }
+
+    /// 蓝牙断开后：查一次真实状态，没锁就补一条锁车，锁完由 9 秒回查确认。
+    ///
+    /// 「双指令」在这里只能是「网络一条 + 重连后蓝牙状态帧补一条」——
+    /// 连接已经断了，蓝牙指令没有物理通道可发，写「已经发了两条」是骗人的。
+    /// 所以日志如实分开写：先发网络，蓝牙那一路等重连后的状态帧。
+    ///
+    /// 已锁就一个字都不发：`allowFarLock` 里的 `armedKnown && armed` 就是这道闸。
+    private func queryAfterLinkLost() {
+        let now = CarAPI.nowMs()
+        // 链路抖动时断开/连上会来回好几次，15 秒内只跑一次
+        if linkLostQueryAt > 0 && now - linkLostQueryAt < 15000 { return }
+        linkLostQueryAt = now
+        if store.chMode == Logic.MODE_BLE {
+            log("· 仅蓝牙模式：断连后不查网络")
+            return
+        }
+        log("▶ 蓝牙断开：发网络状态查询（蓝牙这一路等重连后由状态帧补）")
+        refreshStatus { [weak self] c in
+            guard let self = self else { return }
+            guard let c = c, c.reportedAt > 0 else {
+                self.log("⚠ 断连后状态查询失败，本轮不判断锁车")
+                return
+            }
+            if c.armed {
+                self.log("· 断连查询：车已锁着，不重复下发锁车")
+                return
+            }
+            let t = CarAPI.nowMs()
+            guard Logic.allowFarLock(armedKnown: self.armedKnown, armed: self.armed,
+                                     lockedThisVisit: self.lockedForThisVisit,
+                                     now: t, lastLockAt: self.lastLockAt,
+                                     cooldownMs: self.store.cfg.lockCooldownMs) else {
+                self.log("· 断连查询：车未锁，但闸门拦住（本次已锁过 / 冷却中）→ 不重复")
+                return
+            }
+            guard !self.acting else {
+                self.log("· 断连查询：车未锁，但有一条指令还在飞 → 交给它")
+                return
+            }
+            self.log("▶ 断连查询：车未锁 → 自动补一条锁车")
+            self.requestAction(unlock: false, auto: true)
+        }
     }
 
     /// 状态卡上那行「现在走的是哪条路」。
@@ -5099,6 +5267,7 @@ final class AutoEngine: NSObject, ObservableObject {
             lastUnlockAt = now
             st.unlockedThisVisit = true
             st.visited = true
+            beginUnlockWatch(now)
             // 开锁成功 = 新的一次到访开始，断开时允许再锁一次
             lockedForThisVisit = false
             if ch == Logic.CH_BLE {
@@ -5348,6 +5517,7 @@ final class AutoEngine: NSObject, ObservableObject {
             lastUnlockAt = now
             st.unlockedThisVisit = true
             st.visited = true
+            beginUnlockWatch(now)
             // 开锁成功 = 新的一次到访开始，断开时允许再锁一次
             lockedForThisVisit = false
             if channel == Logic.CH_BLE {
@@ -5563,17 +5733,145 @@ final class AutoEngine: NSObject, ObservableObject {
         return true
     }
 
+    // MARK: 开锁后 10 分钟守夜（1.32）
+
+    /// 开锁成功时调一次。四个成功分支都要调，漏一个就会出现"开锁了但没人守"。
+    private func beginUnlockWatch(_ now: Int64) {
+        unlockWatchAt = now
+        unlockDoorSeen = false
+        unlockWatchDone = false
+        guard unlockWatchTimer == nil else { return }
+        let t = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in
+            self?.unlockWatchTick()
+        }
+        t.tolerance = 5
+        unlockWatchTimer = t
+    }
+
+    private func stopUnlockWatch() {
+        unlockWatchTimer?.invalidate()
+        unlockWatchTimer = nil
+        unlockWatchAt = 0
+        unlockWatchDone = false
+        unlockDoorSeen = false
+    }
+
+    /// 门位一变就记一笔：开过门 = 人上车了，这次不用再守。
+    private func noteDoorForUnlockWatch(_ open: Bool) {
+        if open && unlockWatchAt > 0 { unlockDoorSeen = true }
+    }
+
+    private func unlockWatchTick() {
+        guard unlockWatchAt > 0, !unlockWatchDone else { return }
+        let now = CarAPI.nowMs()
+        if unlockDoorSeen {
+            unlockWatchDone = true
+            stopUnlockWatch()
+            return
+        }
+        guard now - unlockWatchAt >= 600_000 else { return }
+        unlockWatchDone = true
+        unlockWatchTimer?.invalidate()
+        unlockWatchTimer = nil
+        if ble.isConnected {
+            // 用户明确要的边界：蓝牙还在 = 人可能就在车边，不回锁。
+            log("· 开锁 10 分钟未开门，蓝牙还连着 → 不回锁")
+            return
+        }
+        log("▶ 开锁 10 分钟未开门，蓝牙已断 → 按断开即锁规则处理")
+        queryAfterLinkLost()
+    }
+
+    // MARK: 小电池电压（1.32）
+
+    /// 低于 10.8V 推一条。只采信真实读数：空串 / 0 一律当没数据，不误报。
+    private func checkBatteryLow(_ voltText: String) {
+        guard store.notifyEnabled else { return }
+        let v = Double(voltText.trimmingCharacters(in: .whitespaces)) ?? 0
+        guard v > 1, v < 10.8 else { return }
+        let now = CarAPI.nowMs()
+        // 6 小时一条就够：停车时电压本来就低，反复弹只会让人关掉通知
+        guard lastBatteryNotifyAt == 0 || now - lastBatteryNotifyAt > 6 * 3_600_000 else { return }
+        lastBatteryNotifyAt = now
+        log("⚠ 小电池电压 \(String(format: "%.1f", v))V 偏低，已发通知")
+        Notify.shared.batteryLow(volt: v)
+    }
+
+    // MARK: 手动刷新 / 地点名称（1.32）
+
+    /// 手动刷新。先叫车机现在报一次（303505），2.5 秒后再读 203100。
+    ///
+    /// 只读 203100 拿到的是平台缓存，可能停在几分钟前 —— 用户点了刷新却看到旧数据，
+    /// 会以为车没动。所以先点名、后读值。303505 失败也不影响，照读缓存。
+    func manualRefresh() {
+        log("▶ 手动刷新车辆状态（先叫车机上报）")
+        ensureSession { ok in
+            guard ok else {
+                self.log("⚠ 无有效会话，只读缓存")
+                self.refreshStatus()
+                return
+            }
+            DispatchQueue.global(qos: .userInitiated).async {
+                _ = try? self.api.reportNow()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+                    self.refreshStatus()
+                }
+            }
+        }
+    }
+
+    /// 经纬度 → 地名（高德逆地理编码）。
+    ///
+    /// 三条约束：没有 key 不请求；同一点位 5 分钟内不重复请求；失败保持上一次的名字，
+    /// 不要把界面清空 —— 用户看到"定位中"闪来闪去比看到一个稍旧的地名更烦。
+    private func resolvePlace(_ c: CarAPI.Car) {
+        let key = store.str(StoreKey.amapKey)
+        guard !key.isEmpty else { return }
+        guard let lat = Double(c.lat), let lng = Double(c.lng), lat != 0, lng != 0 else { return }
+        let now = CarAPI.nowMs()
+        let moved = abs(lat - placeLat) > 0.005 || abs(lng - placeLng) > 0.005
+        if placeAt > 0, now - placeAt < 300_000, !moved { return }
+        placeAt = now
+        placeLat = lat
+        placeLng = lng
+        let url = "https://restapi.amap.com/v3/geocode/regeo?key=\(key)"
+            + "&location=\(String(format: "%.6f,%.6f", lng, lat))"
+            + "&extensions=base&radius=200&output=json"
+        guard let u = URL(string: url) else { return }
+        URLSession.shared.dataTask(with: u) { [weak self] data, _, _ in
+            // 注意 `try? x as? T` 会被解析成 `try? (x as? T)`，得到双层可选，
+            // 必须先解 JSONSerialization 的结果再转字典，否则 obj 还是个可选、下标编译不过。
+            guard let self = self, let data = data,
+                  let any = try? JSONSerialization.jsonObject(with: data),
+                  let obj = any as? [String: Any],
+                  let re = obj["regeocode"] as? [String: Any] else { return }
+            let addr = (re["formatted_address"] as? String) ?? ""
+            guard !addr.isEmpty else { return }
+            DispatchQueue.main.async {
+                // 高德对无结果会给空数组，这里已经用 String 判过，不会再踩
+                self.placeText = addr
+            }
+        }.resume()
+    }
+
     // MARK: 状态刷新
 
-    func refreshStatus() {
+    /// 带回调版（1.30）。断连后「查完再决定要不要锁车」必须拿到结果。
+    ///
+    /// 失败也回调 `nil` —— 不回调的话调用方会一直等，等于把补锁这件事静默吞掉。
+    /// 不要另外写一个无参重载：带默认值的同名函数会让 `refreshStatus()` 产生歧义。
+    func refreshStatus(_ done: ((CarAPI.Car?) -> Void)? = nil) {
         let epoch = sessionEpoch
         ensureSession { ok in
-            guard ok, epoch == self.sessionEpoch else { return }
+            guard ok, epoch == self.sessionEpoch else { done?(nil); return }
             DispatchQueue.global(qos: .userInitiated).async {
                 let c = self.api.status()
                 DispatchQueue.main.async {
-                    guard epoch == self.sessionEpoch, let c = c else { return }
+                    guard epoch == self.sessionEpoch, let c = c else { done?(nil); return }
                     self.car = c
+                    self.updateVehState(acc: c.acc, eng: c.eng, speedKph: c.speedKph)
+                    self.checkBatteryLow(c.volt)
+                    self.resolvePlace(c)
                     if c.reportedAt > 0 {
                         // 1.15 的修复搬过来：这里以前是直接 `armed = c.armed`，
                         // 绕过了「车辆自锁抑制」。蓝牙断着、只能靠网络查状态时，
@@ -5582,9 +5880,76 @@ final class AutoEngine: NSObject, ObservableObject {
                         // 网络状态是权威的，可直接用来核实蓝牙回执
                         self.checkVerify(now: CarAPI.nowMs())
                     }
+                    done?(c)
                 }
             }
         }
+    }
+
+    // MARK: 自动刷新（1.30）
+
+    /// 打开自动刷新。只在前台有效 —— iOS 进后台后 Timer 必被挂起，
+    /// 之前的版本用「回前台补一次」就是这个原因。
+    private func startAutoRefresh() {
+        autoRefreshEnabled = store.autoRefresh
+        guard store.autoRefresh, autoRefreshTimer == nil else { return }
+        let t = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            self?.autoRefreshTick()
+        }
+        // 容差让系统把这次唤醒和别的活儿合并，别每 60 秒硬醒一次
+        t.tolerance = 8
+        autoRefreshTimer = t
+    }
+
+    private func stopAutoRefresh() {
+        autoRefreshTimer?.invalidate()
+        autoRefreshTimer = nil
+    }
+
+    /// 界面上的开关。
+    func setAutoRefresh(_ on: Bool) {
+        store.autoRefresh = on
+        autoRefreshEnabled = on
+        if on {
+            startAutoRefresh()
+            log("· 自动刷新已开启（蓝牙断着时每 5 分钟查一次；开了走远锁车则为 55 秒）")
+            autoRefreshTick()
+        } else {
+            stopAutoRefresh()
+            log("· 自动刷新已关闭")
+        }
+    }
+
+    /// 定时器 60 秒一拍，但真正发不发由这里的闸门决定。
+    ///
+    /// 1.31 起频率分两档（用户主诉是省电，手动按钮兜底）：
+    /// - 没开「走远锁车」→ 5 分钟一条，够看个大概，剩下的交给手动刷新；
+    /// - 开了「走远锁车」→ 仍按 55 秒，因为 farLock 要靠**新鲜的车锁状态**
+    ///   才敢判「该不该锁」；锁态一旧，实际没锁却记着已锁，车就敞在那儿了。
+    ///
+    /// 三条硬跳过缺一条，就会变成「偷偷联网、偷偷耗电」：
+    /// 仅蓝牙模式、蓝牙正连着、正在执行指令。
+    private func autoRefreshTick() {
+        guard running, !isBackground else { return }
+        if store.chMode == Logic.MODE_BLE { return }
+        // 蓝牙连着就一次都不联网 —— 状态帧 + 回执已经够用
+        if ble.isConnected { return }
+        if acting { return }
+        let now = CarAPI.nowMs()
+        let gap: Int64 = store.geoOn ? 55_000 : 270_000
+        if lastPollAt > 0 && now - lastPollAt < gap { return }
+        lastPollAt = now
+        log("· 自动刷新车辆状态")
+        refreshStatus()
+    }
+
+    /// 把状态字折成「行驶中 / 已启动 / ACC 通电 / 熄火」。
+    ///
+    /// 蓝牙帧只带 acc/eng，车速只有网络才有，所以两边各贡献一半。
+    private func updateVehState(acc: Bool, eng: Bool, speedKph: Int) {
+        let txt = Logic.vehicleStateText(speedKph: speedKph, acc: acc, eng: eng)
+        if txt != vehStateText { vehStateText = txt }
+        if !vehStateShown { vehStateShown = true }
     }
 
     /// 当前是否真的在屏幕上。省电退避按它分档，不能写死。
@@ -5620,6 +5985,7 @@ final class AutoEngine: NSObject, ObservableObject {
             log("· 距上次查询 \(max(0, now - lastPollAt) / 1000)s（<\(gap / 1000)s），这次不查网络")
         }
         refreshStats()
+        startAutoRefresh()
         if running {
             // 定位不再在这里拉起：1.25 起它完全由 decideAction 按「蓝牙有没有信号」决定，
             // 回前台先催一次连接 —— 连上了就一分钱定位电都不花。
@@ -5632,6 +5998,8 @@ final class AutoEngine: NSObject, ObservableObject {
     /// 开了后台定位就必须让它继续跑，否则锁屏后判不了距离。
     func onBackground() {
         isBackground = true
+        // Timer 进后台必被系统挂起，留着只会让人以为还在刷新
+        stopAutoRefresh()
 
         // 后台第一件事：把这次连接请求交给系统。
         //
@@ -5883,8 +6251,18 @@ extension AutoEngine: BleCentralDelegate {
         doorOpen = open
         doorTrunk = trunk
         doorMs = now
+        // 1.32：开过门就说明人上车了，开锁守夜可以收工
+        noteDoorForUnlockWatch(open)
         // 拿到门位了，"锁车前等门位"这件事就不用再等
         doorWaitUntil = 0
+
+        // 1.30：同一个状态字节里还有电源位（0x08 ACC / 0x10 启动）。
+        // 两位全 0 时不采信 —— 那可能是固件没填，此时硬报「熄火」比不报更误导。
+        if body.count > 5 && (body[5] & 0x18) != 0 {
+            bleAcc = (body[5] & 0x08) != 0
+            bleEng = (body[5] & 0x10) != 0
+            updateVehState(acc: bleAcc, eng: bleEng, speedKph: car?.speedKph ?? 0)
+        }
 
         guard changed else { return }
         doorText = "车门：" + (open ? "有门开着" : "全关")
@@ -6554,10 +6932,16 @@ struct MainView: View {
                         .font(.system(size: 26, weight: .bold))
                         .foregroundColor(armedColor)
                     Spacer()
-                    if e.acting {
-                        HStack(spacing: 6) {
-                            ProgressView().progressViewStyle(CircularProgressViewStyle(tint: UI.accent))
-                            Text("执行中").font(.system(size: 12)).foregroundColor(UI.dim)
+                    // 1.30：把「车门」和「车辆状态」放到「已锁车」右边的空位上。
+                    // 以前门位单独占一行，标题右侧一大片空白，扫一眼只能看到锁没锁。
+                    HStack(spacing: 6) {
+                        if e.vehStateShown {
+                            stateBadge(e.vehStateText, color: vehStateColor)
+                        }
+                        stateBadge(doorBadgeText, color: doorColor)
+                        if e.acting {
+                            ProgressView()
+                                .progressViewStyle(CircularProgressViewStyle(tint: UI.accent))
                         }
                     }
                 }
@@ -6598,17 +6982,21 @@ struct MainView: View {
                         .foregroundColor(UI.dim)
                 }
 
-                // 门位：色点 + 文字。全关绿、有门开着橙、没数据灰。
-                // 之前只用 10 号灰字，门开了也看不出来，等于白做。
-                HStack(spacing: 7) {
-                    Circle()
-                        .fill(doorColor)
-                        .frame(width: 7, height: 7)
-                    Text(e.doorText)
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundColor(doorColor)
-                    Spacer()
+                // 1.32：车辆所在地名。没填高德 key、或还没解析出来时，整行不显示。
+                if !e.placeText.isEmpty {
+                    HStack(spacing: 6) {
+                        Image(systemName: "mappin.and.ellipse")
+                            .font(.system(size: 11))
+                            .foregroundColor(UI.dim)
+                        Text(e.placeText)
+                            .font(.system(size: 12))
+                            .foregroundColor(UI.dim)
+                            .lineLimit(1)
+                        Spacer(minLength: 0)
+                    }
                 }
+
+                // 门位已并到标题行右侧的徽标里（1.30），这里不再单独占一行
 
                 // 「为什么现在不动手」。1.22 新增：以前这个理由只写进日志，
                 // 用户想知道「刚才走近了为什么没开锁」必须去诊断页翻。
@@ -6623,6 +7011,15 @@ struct MainView: View {
                         Spacer(minLength: 0)
                     }
                 }
+
+                // 1.31：手动刷新不再置灰。自动刷新已经降到 5 分钟，这个按钮就是
+                // 用户想看最新状态时的唯一手段 —— 灰着不让人点，等于把兜底也拿走了。
+                GhostButton(title: "刷新车辆状态",
+                            color: UI.accent,
+                            enabled: true) {
+                    // 1.32：先叫车机上报（303505），2.5 秒后再读，不然看到的是缓存
+                    e.manualRefresh()
+                }
             }
         }
     }
@@ -6631,6 +7028,35 @@ struct MainView: View {
     private var doorColor: Color {
         if !e.doorShown { return UI.dim }
         return e.doorAlert ? UI.warn : UI.ok
+    }
+
+    /// 标题行右侧的车门徽标。写成「车门 全关」而不是整句，是为了和车辆状态并排不折行。
+    private var doorBadgeText: String {
+        if !e.doorShown { return "车门 —" }
+        return e.doorAlert ? "车门 开着" : "车门 全关"
+    }
+
+    /// 车辆状态徽标颜色：熄火灰、ACC 橙、启动与行驶绿
+    private var vehStateColor: Color {
+        guard e.vehStateShown else { return UI.dim }
+        switch e.vehStateText {
+        case "行驶中", "已启动": return UI.ok
+        case "ACC 通电":        return UI.warn
+        default:                return UI.dim
+        }
+    }
+
+    private func stateBadge(_ text: String, color: Color) -> some View {
+        Text(text)
+            .font(.system(size: 11, weight: .medium))
+            .foregroundColor(color)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .overlay(
+                RoundedRectangle(cornerRadius: 6)
+                    .stroke(color.opacity(0.45), lineWidth: 0.8)
+            )
+            .fixedSize()
     }
 
     private func statItem(_ t: String, _ v: String, _ c: Color) -> some View {
@@ -6795,6 +7221,34 @@ struct MainView: View {
                 }
 
                 Divider().background(UI.line)
+
+                toggleRow("自动刷新车辆状态",
+                          "蓝牙断着时每 5 分钟查一次；蓝牙连着靠状态帧刷新，一次都不联网",
+                          isOn: Binding(get: { e.autoRefreshEnabled },
+                                        set: { e.setAutoRefresh($0) }))
+
+                // 1.32：高德 key。填了状态卡才显示地名，不填就完全不发这条请求。
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 8) {
+                        Text("高德 Key")
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundColor(UI.text)
+                        Spacer(minLength: 8)
+                        TextField("填了才显示地名", text: Binding(
+                            get: { Store.shared.str(StoreKey.amapKey) },
+                            set: { Store.shared.put(StoreKey.amapKey, $0) }))
+                            .font(.system(size: 12))
+                            .multilineTextAlignment(.trailing)
+                            .foregroundColor(UI.dim)
+                            // iOS 14 兼容：不能用 textInputAutocapitalization（15+）
+                            .autocapitalization(.none)
+                            .disableAutocorrection(true)
+                    }
+                    Text("用高德开放平台的 Web 服务 key，只做「经纬度 → 地名」，不上传任何车辆信息。")
+                        .font(.system(size: 11))
+                        .foregroundColor(UI.dim)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
 
                 // 指令通道（1.26）：用户要的「纯蓝牙 / 自由选择 / 一起共用」。
                 VStack(alignment: .leading, spacing: 8) {
