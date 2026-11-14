@@ -3949,7 +3949,7 @@ final class AutoEngine: NSObject, ObservableObject {
     /// 参与了编译，界面上才会跟着变。
     ///
     /// 每次改源码就换一个值，装完瞄一眼底部就知道装的是哪一次构建。
-    static let buildTag = "b1110c"
+    static let buildTag = "b1110f"
 
     let ble = BleCentral()
     let api = CarAPI()
@@ -6032,9 +6032,12 @@ final class AutoEngine: NSObject, ObservableObject {
                     // 1.35：顺手落一个轨迹点。放这里而不是地图页里，是因为轨迹要在
                     // 「后台也是一直在查状态」的情况下才连贯 —— 地图页关掉也得记。
                     // 15 米内的重复点 TrackStore 自己会丢。
+                    // 1.38：带上速度 —— 原版回放时每个点都显示 KM/H，
+                    // 没有速度这一列，回放页那行数字就是空的。
                     TrackStore.shared.append(lat: Double(c.lat) ?? 0,
                                              lng: Double(c.lng) ?? 0,
-                                             at: c.reportedAt > 0 ? c.reportedAt : c.fetchedAt)
+                                             at: c.reportedAt > 0 ? c.reportedAt : c.fetchedAt,
+                                             kph: Double(c.speedKph))
                     self.updateVehState(acc: c.acc, eng: c.eng, speedKph: c.speedKph)
                     self.checkBatteryLow(c.volt)
                     self.resolvePlace(c)
@@ -7870,32 +7873,71 @@ struct CarMapView: UIViewRepresentable {
 
 
 // ==========================================================================
-//  SXKC/UI/MapPage.swift  ——  全屏地图页（围栏/轨迹/导航）
+//  SXKC/UI/MapPage.swift  ——  全屏地图页（实时追踪/围栏/轨迹/导航入口）
 // ==========================================================================
 
 //
 //  MapPage.swift
-//  1.35：全屏地图页
+//  1.39：地图页五个功能按原版重做（三个整屏页在 MapPanels.swift）
 //
-//  照原版 App 的地图页做的：地图铺满，车标居中，右边一列浮动圆按钮，
-//  底部一张车辆信息卡 + 五个功能入口。
+//  —— 以下是拆包得到的原版实现，不是猜的 ——
 //
-//  为什么全用 MapKit：原版 iOS 包（顺心控车 1.0.6）的主二进制里
-//  MAMapKit / AMap 出现 0 次，MKMapView 出现 18 次 —— 它自己就是用苹果
-//  地图画的。大陆的 MapKit 底层是高德底图、坐标是 GCJ-02，所以**车机给的
-//  WGS-84 原始坐标必须先换算一次**（见 MapGeo.swift），不换就差几百米。
-//  原版二进制里同样带着那套转换常量，说明它也是这么处理的。
+//  · 实时追踪 = TrackFlowController（iOS 二进制里同样有 TrackFlowController /
+//    TrackFlowControllerFactory / showTrackFlow）。做法是**定时器循环**：
+//    安卓版每轮 60 秒（const-wide/32 #0xEA60），先发 303598 叫车机定位，
+//    等 1.9 秒（const-wide/16 #0x76C）再发 203100 读状态；地图跟着车走，
+//    同时用手机 GPS 算「我离车多远」，字段名 lloc.pcdis。
+//  · 电子围栏 = GeoFenceController + GeoFenceCellItem。**是一个列表**：
+//    多个围栏，各有名字 / 圆心 / 半径；半径用 slider 调（默认 500，上限 5000，
+//    步长由配置 101321 下发）；圆心可以放在车上或手机上（oncar / onphone）；
+//    字段 geo.geoname / geo.radius / geo.circle.lat / geo.circle.lng /
+//    geo.gis_id / geo.path / geo.type；显示开关 101323。
+//    1.39 按原版截图补了编辑页的两个报警开关：入围栏报警 / 出围栏报警。
+//  · 历史轨迹 = HistoryListView（按天列表）+ HistoryController（回放）：
+//    先列出**每一天**一条（日期、里程 miles、平均速度 avgspd、最高速度 maxspd、
+//    起止时间），点某天进回放页：进度条 slider + 前进 forward / 后退 backward +
+//    播放 his.start / 停止 his.stop，每个点显示速度（KM/H），还能切卫星图和路况。
+//  · 导航到车 = ActionMapNavi：探测装了哪个地图——高德 com.autonavi.minimap、
+//    百度 com.baidu.BaiduMap、腾讯 com.tencent.map，用 URI 直接唤起并进驾车路线；
+//    一个都没装就开网页版。目的地取 lloc.lat / lloc.lng。
+//  · 车辆设置 = GPS 功能设置页（原版截图就三行）：GPS 开关 / 电子围栏 /
+//    隐私模式 + 查询 / 保存。有三个字段能对上：config.devcfg.privacy、
+//    parseVstStatus 里读的 gps_opn / gps_cls / gps_loc。**但写入走哪条指令码
+//    没有实证**（iOS 主二进制是 FairPlay 加密的，字符串读不出来），所以这一版
+//    开关只记在本机，保存时会如实告诉用户，不硬发一条可能改坏车机参数的指令。
+//
+//  坐标：车机给 WGS-84，大陆 MapKit 要 GCJ-02，画之前统一过 MapGeo.display()。
+//  原版二进制里带着同一套转换常量（6378245.0 / -0.006693421622965943），
+//  说明它也是这么处理的。
 //
 
 
-// MARK: - 本地轨迹
+// MARK: - 轨迹仓库
 
-/// 历史轨迹自己记。
-///
-/// 原版的轨迹是车机上报到服务器、App 再拉回来的；我们这边没有那条接口的
-/// 明文参数，先用本地记录兜底：每刷新到一次车辆位置就落一个点，按天存
-/// JSON。停车时点不涨（15 米内丢弃），开一天大概几百个点。
+/// 本机轨迹。原版的轨迹是车机上报到服务器、App 再按天拉回来的
+/// （HistoryListView 的 dayqry / tripqry，page_size 31）；我们这边拿不到
+/// 那条接口的明文参数，先用本机记录顶上 —— 结构照原版：按天存、按天汇总。
 final class TrackStore {
+
+    /// 一个轨迹点。原版每个点带速度（回放时显示 KM/H）和时间（hisfmt）。
+    struct Pt {
+        var lat: Double
+        var lng: Double
+        var ts: Int64      // 毫秒
+        var kph: Double
+    }
+
+    /// 一天的小结。对应原版列表里的一行：日期 / 里程 / 平均速度 / 最高速度。
+    struct Day {
+        var key: String        // yyyyMMdd
+        var date: Date
+        var count: Int
+        var km: Double
+        var avgKph: Double
+        var maxKph: Double
+        var startAt: Int64
+        var endAt: Int64
+    }
 
     static let shared = TrackStore()
 
@@ -7923,56 +7965,257 @@ final class TrackStore {
         return dayFmt.string(from: Date(timeIntervalSince1970: TimeInterval(sec)))
     }
 
-    private func loadRows(_ url: URL) -> [[Double]] {
+    /// 读一天的点。兼容老格式（只有 [lat,lng] 两列）。
+    private func loadPts(_ url: URL) -> [Pt] {
         guard let data = try? Data(contentsOf: url),
-              let any = try? JSONSerialization.jsonObject(with: data, options: []) else {
+              let any = try? JSONSerialization.jsonObject(with: data, options: []),
+              let arr = any as? [[Any]] else {
             return []
         }
-        guard let arr = any as? [[Any]] else { return [] }
-        var out: [[Double]] = []
+        var out: [Pt] = []
         for r in arr {
-            if r.count >= 2, let a = r[0] as? Double, let b = r[1] as? Double {
-                out.append([a, b])
-            }
+            guard r.count >= 2,
+                  let a = r[0] as? Double, let b = r[1] as? Double else { continue }
+            var t: Int64 = 0
+            var v: Double = 0
+            if r.count >= 3, let x = r[2] as? Double { t = Int64(x) }
+            if r.count >= 4, let x = r[3] as? Double { v = x }
+            out.append(Pt(lat: a, lng: b, ts: t, kph: v))
         }
         return out
     }
 
-    /// 记一个点。离上一个点不到 15 米直接丢掉。
-    func append(lat: Double, lng: Double, at ms: Int64) {
-        guard lat.isFinite, lng.isFinite, lat != 0, lng != 0 else { return }
-        let url = fileURL(dayOf(ms))
-        var rows = loadRows(url)
-        if let last = rows.last, last.count >= 2 {
-            let d = CLLocation(latitude: last[0], longitude: last[1])
-                .distance(from: CLLocation(latitude: lat, longitude: lng))
-            if d < 15 { return }
+    private func savePts(_ pts: [Pt], to url: URL) {
+        var rows: [[Double]] = []
+        rows.reserveCapacity(pts.count)
+        for p in pts {
+            rows.append([p.lat, p.lng, Double(p.ts), p.kph])
         }
-        rows.append([lat, lng])
         if let data = try? JSONSerialization.data(withJSONObject: rows, options: []) {
             try? data.write(to: url, options: .atomic)
         }
     }
 
-    /// 取最近几天的轨迹点，按时间正序（昨天 → 今天）。
-    func points(daysBack: Int = 1, now: Int64 = Int64(Date().timeIntervalSince1970)) -> [CLLocationCoordinate2D] {
+    /// 记一个点。15 米内、且不到 30 秒，直接丢掉 —— 停车时点不会无限涨。
+    func append(lat: Double, lng: Double, at ms: Int64, kph: Double) {
+        guard lat.isFinite, lng.isFinite, lat != 0, lng != 0 else { return }
+        let t = ms > 100_000_000_000 ? ms : ms * 1000
+        let url = fileURL(dayOf(t))
+        var pts = loadPts(url)
+        if let last = pts.last {
+            let d = CLLocation(latitude: last.lat, longitude: last.lng)
+                .distance(from: CLLocation(latitude: lat, longitude: lng))
+            if d < 15 || t - last.ts < 30_000 { return }
+        }
+        pts.append(Pt(lat: lat, lng: lng, ts: t, kph: max(0, kph)))
+        savePts(pts, to: url)
+    }
+
+    /// 一天的原始点（WGS-84，未换算）。
+    func points(day key: String) -> [Pt] {
+        return loadPts(fileURL(key))
+    }
+
+    /// 最近几天的点，按时间正序（昨天 → 今天），已换成地图坐标。
+    func points(daysBack: Int = 1,
+                now: Int64 = Int64(Date().timeIntervalSince1970)) -> [CLLocationCoordinate2D] {
         var out: [CLLocationCoordinate2D] = []
         let span = max(0, daysBack)
         for i in stride(from: span, through: 0, by: -1) {
             let d = Date(timeIntervalSince1970: TimeInterval(now - Int64(i) * 86400))
             let day = dayFmt.string(from: d)
-            for r in loadRows(fileURL(day)) {
-                out.append(CLLocationCoordinate2D(latitude: r[0], longitude: r[1]))
+            for p in loadPts(fileURL(day)) {
+                out.append(MapGeo.display(lat: p.lat, lng: p.lng))
             }
         }
-        if out.count > 2000 {
-            return Array(out.suffix(2000))
-        }
+        if out.count > 2000 { return Array(out.suffix(2000)) }
         return out
     }
 
+    /// 按天汇总，日期新的在前。原版列表一次给 31 天。
+    func days() -> [Day] {
+        let fm = FileManager.default
+        guard let list = try? fm.contentsOfDirectory(at: dir,
+                                                     includingPropertiesForKeys: nil) else {
+            return []
+        }
+        var out: [Day] = []
+        for u in list {
+            guard u.lastPathComponent.hasPrefix("t_"), u.pathExtension == "json" else { continue }
+            let key = u.deletingPathExtension().lastPathComponent
+                .replacingOccurrences(of: "t_", with: "")
+            let pts = loadPts(u)
+            if pts.isEmpty { continue }
+
+            var km = 0.0
+            var maxV = 0.0
+            var sumV = 0.0
+            var nV = 0
+            if pts.count >= 2 {
+                for i in 1..<pts.count {
+                    let a = CLLocation(latitude: pts[i - 1].lat, longitude: pts[i - 1].lng)
+                    let b = CLLocation(latitude: pts[i].lat, longitude: pts[i].lng)
+                    km += a.distance(from: b)
+                }
+            }
+            for p in pts {
+                if p.kph > maxV { maxV = p.kph }
+                if p.kph > 0 { sumV += p.kph; nV += 1 }
+            }
+            km = km / 1000.0
+
+            let s = pts.first?.ts ?? 0
+            let e = pts.last?.ts ?? 0
+            var avg = 0.0
+            if e > s {
+                avg = km / (Double(e - s) / 3_600_000.0)
+            } else if nV > 0 {
+                avg = sumV / Double(nV)
+            }
+
+            out.append(Day(key: key,
+                           date: dayFmt.date(from: key) ?? Date(),
+                           count: pts.count,
+                           km: km,
+                           avgKph: avg,
+                           maxKph: maxV,
+                           startAt: s,
+                           endAt: e))
+        }
+        out.sort { $0.key > $1.key }
+        if out.count > 31 { return Array(out.prefix(31)) }
+        return out
+    }
+
+    /// 清空本机轨迹（只删手机里的 JSON，车机与服务端不受影响）。
+    func clear() {
+        let fm = FileManager.default
+        if let list = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) {
+            for u in list where u.pathExtension == "json" {
+                try? fm.removeItem(at: u)
+            }
+        }
+    }
+
     func countToday(now: Int64 = Int64(Date().timeIntervalSince1970)) -> Int {
-        return loadRows(fileURL(dayFmt.string(from: Date(timeIntervalSince1970: TimeInterval(now))))).count
+        return loadPts(fileURL(dayFmt.string(from: Date(timeIntervalSince1970: TimeInterval(now))))).count
+    }
+}
+
+// MARK: - 围栏仓库
+
+/// 电子围栏。原版存服务端（geo.gis_id / geo.path / geo.type，增 geo.301502、
+/// 删 geo.301503，条目里 gis_uuid 是唯一号）；这里没有那条写入接口，
+/// 先存本机，结构照原版：多个、有名字、有半径、有显示开关。
+final class FenceStore {
+
+    struct Fence: Codable, Identifiable {
+        var id: String
+        var name: String
+        var lat: Double        // WGS-84 原始坐标，画的时候再换算
+        var lng: Double
+        var radius: Double     // 米
+        var on: Bool           // 是否参与越界判定
+        var inAlert: Bool      // 入围栏报警（原版编辑页第一个开关，默认关）
+        var outAlert: Bool     // 出围栏报警（原版编辑页第二个开关，默认开）
+
+        init(id: String, name: String, lat: Double, lng: Double,
+             radius: Double, on: Bool,
+             inAlert: Bool = false, outAlert: Bool = true) {
+            self.id = id
+            self.name = name
+            self.lat = lat
+            self.lng = lng
+            self.radius = radius
+            self.on = on
+            self.inAlert = inAlert
+            self.outAlert = outAlert
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case id, name, lat, lng, radius, on, inAlert, outAlert
+        }
+
+        /// 1.39 才加 inAlert / outAlert。1.38 存下来的 fences.json 里没有这两个键，
+        /// 直接合成解码会整条失败、老围栏全丢，所以这里逐键 decodeIfPresent。
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            id = (try? c.decode(String.self, forKey: .id)) ?? UUID().uuidString
+            name = (try? c.decode(String.self, forKey: .name)) ?? "围栏"
+            lat = (try? c.decode(Double.self, forKey: .lat)) ?? 0
+            lng = (try? c.decode(Double.self, forKey: .lng)) ?? 0
+            radius = (try? c.decode(Double.self, forKey: .radius)) ?? 500
+            on = (try? c.decode(Bool.self, forKey: .on)) ?? true
+            inAlert = (try? c.decode(Bool.self, forKey: .inAlert)) ?? false
+            outAlert = (try? c.decode(Bool.self, forKey: .outAlert)) ?? true
+        }
+    }
+
+    static let shared = FenceStore()
+
+    private let url: URL
+    private(set) var list: [Fence] = []
+
+    private init() {
+        let base = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        url = base.appendingPathComponent("fences.json")
+        reload()
+    }
+
+    func reload() {
+        guard let data = try? Data(contentsOf: url),
+              let arr = try? JSONDecoder().decode([Fence].self, from: data) else {
+            list = []
+            return
+        }
+        list = arr
+    }
+
+    private func flush() {
+        if let data = try? JSONEncoder().encode(list) {
+            try? data.write(to: url, options: .atomic)
+        }
+    }
+
+    /// 新增或更新。id 相同就替换。
+    func save(_ f: Fence) {
+        if let i = list.firstIndex(where: { $0.id == f.id }) {
+            list[i] = f
+        } else {
+            list.append(f)
+        }
+        flush()
+    }
+
+    func remove(id: String) {
+        list.removeAll { $0.id == id }
+        flush()
+    }
+
+    func setOn(id: String, _ v: Bool) {
+        if let i = list.firstIndex(where: { $0.id == id }) {
+            list[i].on = v
+            flush()
+        }
+    }
+
+    /// 自动起名，对应原版 lang.map.geofence.gen_name（"围栏 N"）。
+    func nextName() -> String {
+        var n = list.count + 1
+        var name = "围栏 " + String(n)
+        while list.contains(where: { $0.name == name }) {
+            n += 1
+            name = "围栏 " + String(n)
+        }
+        return name
+    }
+
+    func makeNew(at lat: Double, lng: Double) -> Fence {
+        return Fence(id: UUID().uuidString,
+                     name: nextName(),
+                     lat: lat, lng: lng,
+                     radius: 500,
+                     on: true)
     }
 }
 
@@ -8023,7 +8266,6 @@ final class CarPinView: MKAnnotationView {
         return renderer.image { _ in
             let green = UIColor(red: 0.10, green: 0.66, blue: 0.34, alpha: 1.0)
 
-            // 圆角方块
             let box = CGRect(x: w / 2 - 17, y: 2, width: 34, height: 34)
             let path = UIBezierPath(roundedRect: box, cornerRadius: 10)
             green.setFill()
@@ -8032,13 +8274,11 @@ final class CarPinView: MKAnnotationView {
             path.lineWidth = 2
             path.stroke()
 
-            // 车图标
             if let icon = UIImage(systemName: "car.fill")?
                 .withTintColor(.white, renderingMode: .alwaysOriginal) {
                 icon.draw(in: CGRect(x: w / 2 - 11, y: 8, width: 22, height: 22))
             }
 
-            // 名字
             let para = NSMutableParagraphStyle()
             para.alignment = .center
             let attrs: [NSAttributedString.Key: Any] = [
@@ -8061,17 +8301,31 @@ final class CarPinView: MKAnnotationView {
 
 // MARK: - 地图画布
 
+/// 一个要画的围栏圆（已经换算成地图坐标）。
+struct FenceRing {
+    var key: String
+    var center: CLLocationCoordinate2D
+    var radius: Double
+    var on: Bool
+}
+
 struct MapCanvas: UIViewRepresentable {
 
     var center: CLLocationCoordinate2D?
     var name: String
     var follow: Bool
     var recenter: Int
-    var circleM: Double
+    var rings: [FenceRing]
     var track: [CLLocationCoordinate2D]
     var route: [CLLocationCoordinate2D]
     var mine: CLLocationCoordinate2D?
     var focusMine: Int
+    var replayDot: CLLocationCoordinate2D?
+    var satellite: Bool
+    var traffic: Bool
+    /// 1.39：把这一组点全部框进屏幕。历史轨迹页「切换」到地图时用它 ——
+    /// 只靠 center 传一个点，跑了几十公里的一天会被裁掉大半条线。
+    var fit: [CLLocationCoordinate2D] = []
 
     func makeCoordinator() -> Coord {
         return Coord()
@@ -8094,7 +8348,6 @@ struct MapCanvas: UIViewRepresentable {
         mv.showsScale = false
         mv.showsBuildings = true
         mv.mapType = .standard
-        // 全屏页保留商铺和地名图标：原版截图里机场、公园、路口都有标
         mv.pointOfInterestFilter = .includingAll
         context.coordinator.lastRecenter = -99
         context.coordinator.lastFocusMine = 0
@@ -8103,6 +8356,11 @@ struct MapCanvas: UIViewRepresentable {
 
     func updateUIView(_ mv: MKMapView, context: Context) {
         let c = context.coordinator
+
+        // 0. 图层：原版有 btnsatellite / btntraffic 两个开关
+        let want: MKMapType = satellite ? .satellite : .standard
+        if mv.mapType != want { mv.mapType = want }
+        if mv.showsTraffic != traffic { mv.showsTraffic = traffic }
 
         // 1. 车标
         var pin: CarPoint?
@@ -8142,15 +8400,19 @@ struct MapCanvas: UIViewRepresentable {
                          animated: true)
         }
 
-        // 4. 围栏圆
-        let key = circleM > 1 ? "\(Int(circleM))|\(center?.latitude ?? 0)|\(center?.longitude ?? 0)" : "off"
-        if key != c.lastCircleKey {
-            c.lastCircleKey = key
+        // 4. 围栏圆（可能是多个）。整组内容变了才重画。
+        var ringKey = ""
+        for r in rings { ringKey += r.key + "|" }
+        if ringKey != c.lastRingKey {
+            c.lastRingKey = ringKey
             for o in mv.overlays {
-                if o is MKCircle { mv.removeOverlay(o) }
+                if let ci = o as? MKCircle, ci.title == "fence" { mv.removeOverlay(ci) }
             }
-            if circleM > 1, let p = center {
-                mv.addOverlay(MKCircle(center: p, radius: circleM))
+            for r in rings {
+                if !r.on { continue }
+                let ci = MKCircle(center: r.center, radius: r.radius)
+                ci.title = "fence"
+                mv.addOverlay(ci)
             }
         }
 
@@ -8179,15 +8441,51 @@ struct MapCanvas: UIViewRepresentable {
                 mv.addOverlay(line)
             }
         }
+
+        // 7. 回放点（一个小圆，跟着进度走）
+        var dotKey = "off"
+        if let d = replayDot {
+            dotKey = String(format: "%.6f,%.6f", d.latitude, d.longitude)
+        }
+        if dotKey != c.lastDotKey {
+            c.lastDotKey = dotKey
+            for o in mv.overlays {
+                if let ci = o as? MKCircle, ci.title == "replay" { mv.removeOverlay(ci) }
+            }
+            if let d = replayDot {
+                let ci = MKCircle(center: d, radius: 16)
+                ci.title = "replay"
+                mv.addOverlay(ci)
+            }
+        }
+
+        // 8. 视野自适应（历史轨迹页用）。整天的线要一次框进来，
+        //    否则镜头停在起点，后面几十公里的轨迹全在屏幕外面。
+        if fit.count != c.lastFitCount, fit.count >= 2 {
+            c.lastFitCount = fit.count
+            var rect = MKMapRect.null
+            for p in fit {
+                let pt = MKMapPoint(p)
+                rect = rect.union(MKMapRect(x: pt.x, y: pt.y, width: 0, height: 0))
+            }
+            if !rect.isNull {
+                mv.setVisibleMapRect(rect,
+                                     edgePadding: UIEdgeInsets(top: 40, left: 40,
+                                                               bottom: 40, right: 40),
+                                     animated: false)
+            }
+        }
     }
 
     final class Coord: NSObject, MKMapViewDelegate {
         var lastCenter: CLLocationCoordinate2D?
         var lastRecenter = -99
         var lastFocusMine = 0
-        var lastCircleKey = ""
+        var lastRingKey = ""
         var lastTrackCount = -1
         var lastRouteCount = -1
+        var lastDotKey = ""
+        var lastFitCount = -1
 
         func mapView(_ mapView: MKMapView, viewFor annotation: MKAnnotation) -> MKAnnotationView? {
             guard let p = annotation as? CarPoint else { return nil }
@@ -8203,6 +8501,14 @@ struct MapCanvas: UIViewRepresentable {
         func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
             if let c = overlay as? MKCircle {
                 let r = MKCircleRenderer(circle: c)
+                if c.title == "replay" {
+                    // 回放点：橘黄色实心小圆
+                    r.strokeColor = UIColor(red: 0.98, green: 0.62, blue: 0.04, alpha: 1.0)
+                    r.fillColor = UIColor(red: 0.98, green: 0.62, blue: 0.04, alpha: 0.85)
+                    r.lineWidth = 2
+                    return r
+                }
+                // 围栏：原版颜色是 00FF00 描边 + 淡填充
                 r.strokeColor = UIColor(red: 0.13, green: 0.77, blue: 0.37, alpha: 0.95)
                 r.fillColor = UIColor(red: 0.13, green: 0.77, blue: 0.37, alpha: 0.12)
                 r.lineWidth = 2
@@ -8228,36 +8534,102 @@ struct MapCanvas: UIViewRepresentable {
 
 // MARK: - 地图页
 
+/// 地图页弹出的面板。同一个视图只挂**一个** .sheet —— 挂多个的话
+/// iOS 14 上只有最后一个生效。
+/// 地图页上只还剩一个 .sheet —— 导航到车。围栏、轨迹、GPS 设置三个都改成
+/// 整屏页面了（见 MapPanels.swift），因为它们都需要整屏高度。
+private enum MapSheet: String, Identifiable {
+    case navi
+    var id: String { rawValue }
+}
+
 struct MapPage: View {
 
     @EnvironmentObject var e: AutoEngine
     @Binding var isPresented: Bool
 
+    // 地图状态
     @State private var follow = true
     @State private var recenter = 0
     @State private var focusMine = 0
-    @State private var circleM: Double = 0
+    @State private var satellite = false
+    @State private var traffic = false
     @State private var track: [CLLocationCoordinate2D] = []
     @State private var route: [CLLocationCoordinate2D] = []
-    @State private var showFence = false
+    @State private var replayDot: CLLocationCoordinate2D? = nil
+
+    // 必须显式 = nil：有默认值才会被排除在 memberwise init 之外，
+    // 否则 MapPage(isPresented:) 这个调用会变成缺参数。
+    @State private var sheet: MapSheet? = nil
     @State private var hint = ""
+
+    // 实时追踪
+    @State private var tracking = false
+    @State private var trackTimer: Timer? = nil
+    @State private var distText = ""
+
+    // 围栏
+    @State private var fences: [FenceStore.Fence] = []
+    @State private var inFence: [String: Bool] = [:]
+
+    // 1.39：三个整屏页面（电子围栏列表 / 围栏编辑 / 历史轨迹 / GPS 功能设置）。
+    // 用 ZStack 直接盖，不走 .sheet —— 这两个页面都需要整屏地图，sheet 只有
+    // 半屏高度，而且同一个视图上再挂 presentation 在 iOS 14 上会互相顶掉。
+    @State private var showFenceList = false
+    @State private var showFenceEdit = false
+    @State private var editFence: FenceStore.Fence? = nil
+    @State private var showHistory = false
+    @State private var showGpsSet = false
 
     // MARK: 数据
 
-    private var carCoord: CLLocationCoordinate2D? {
+    private var carLatLng: (Double, Double)? {
         guard let c = e.car,
               let lat = Double(c.lat), let lng = Double(c.lng),
               lat != 0, lng != 0 else { return nil }
-        // 1.36：车机给的是 WGS-84 原始坐标，地图（大陆 MapKit = 高德底图）要 GCJ-02，
-        // 差 300~700 米。原版也是这么换的，见 MapGeo 文件头的说明。
-        return MapGeo.display(lat: lat, lng: lng)
+        return (lat, lng)
+    }
+
+    private var carCoord: CLLocationCoordinate2D? {
+        guard let p = carLatLng else { return nil }
+        // 车机给的是 WGS-84，地图要 GCJ-02，差 300~700 米
+        return MapGeo.display(lat: p.0, lng: p.1)
     }
 
     private var mineCoord: CLLocationCoordinate2D? {
         let lat = e.loc.lat, lng = e.loc.lng
         guard lat != 0, lng != 0 else { return nil }
-        // CoreLocation 同样给 WGS-84，放进地图、丢给 MKDirections 也得先转
         return MapGeo.display(lat: lat, lng: lng)
+    }
+
+    /// 手机定位的原始坐标（WGS-84）。围栏要存原始值 —— 存换算后的 GCJ 再换算一次，
+    /// 来回一折腾就漂出去几十米了。
+    private var mineLatLng: (Double, Double)? {
+        let lat = e.loc.lat, lng = e.loc.lng
+        guard lat != 0, lng != 0 else { return nil }
+        return (lat, lng)
+    }
+
+    /// 手机到车的直线距离。原版这个数叫 lloc.pcdis，显示在车辆卡上。
+    private var phoneCarKm: Double? {
+        guard let p = carLatLng else { return nil }
+        let lat = e.loc.lat, lng = e.loc.lng
+        guard lat != 0, lng != 0 else { return nil }
+        let d = CLLocation(latitude: lat, longitude: lng)
+            .distance(from: CLLocation(latitude: p.0, longitude: p.1))
+        return d / 1000.0
+    }
+
+    private var rings: [FenceRing] {
+        var out: [FenceRing] = []
+        for f in fences {
+            let c = MapGeo.display(lat: f.lat, lng: f.lng)
+            let key = f.id + "," + String(format: "%.6f", c.latitude)
+                + "," + String(format: "%.6f", c.longitude)
+                + "," + String(Int(f.radius)) + "," + (f.on ? "1" : "0")
+            out.append(FenceRing(key: key, center: c, radius: f.radius, on: f.on))
+        }
+        return out
     }
 
     private var carName: String {
@@ -8276,7 +8648,16 @@ struct MapPage: View {
         if ms <= 0 { return "--" }
         let sec = ms > 100_000_000_000 ? ms / 1000 : ms
         let f = DateFormatter()
-        f.dateFormat = "MM-dd HH:mm:ss"
+        f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        f.locale = Locale(identifier: "en_US_POSIX")
+        return f.string(from: Date(timeIntervalSince1970: TimeInterval(sec)))
+    }
+
+    private func hm(_ ms: Int64) -> String {
+        if ms <= 0 { return "--:--" }
+        let sec = ms > 100_000_000_000 ? ms / 1000 : ms
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm"
         f.locale = Locale(identifier: "en_US_POSIX")
         return f.string(from: Date(timeIntervalSince1970: TimeInterval(sec)))
     }
@@ -8292,309 +8673,564 @@ struct MapPage: View {
         return t + "°"
     }
 
+    /// 四个整屏页面里有没有开着的。开着就要把状态栏那片也压成深色。
+    private var pageOpen: Bool {
+        return showFenceList || showFenceEdit || showHistory || showGpsSet
+    }
+
     // MARK: 界面
 
+    /// 布局：**地图在上，操作区在地图下方，两者不重叠**。
+    ///
+    /// 为什么不按原版那样把按钮浮在地图上：UIKit 的命中测试只认 UIView，
+    /// SwiftUI 画出来的按钮不是 UIView。当一张全屏 MKMapView 在下面时，
+    /// 点在这些"浮"按钮上的触摸会先被地图的手势识别器接走，表现就是
+    /// 「点了没反应」。把操作区挪到地图外面，就不存在抢触摸的问题了。
     var body: some View {
-        ZStack(alignment: .topLeading) {
-            MapCanvas(center: carCoord,
-                      name: carName,
-                      follow: follow,
-                      recenter: recenter,
-                      circleM: circleM,
-                      track: track,
-                      route: route,
-                      mine: mineCoord,
-                      focusMine: focusMine)
-                .ignoresSafeArea()
-
-            backButton
-            rightColumn
-
-            VStack(spacing: 8) {
-                Spacer()
-                if !hint.isEmpty {
-                    Text(hint)
-                        .font(.system(size: 11))
-                        .foregroundColor(UI.text)
-                        .multilineTextAlignment(.center)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 7)
-                        .background(UI.card.opacity(0.94))
-                        .cornerRadius(9)
-                        .padding(.horizontal, 16)
-                }
-                bottomPanel
+        ZStack {
+            VStack(spacing: 0) {
+                mapZone
+                panel
             }
-            // ZStack 提议的是全屏尺寸，但 VStack 自己只按子视图算宽度 ——
-            // 不撑满的话信息卡会缩成一小条贴在左上角
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            // 页面打开时先垫一层，把状态栏和 Home 指示条那两条也压成深色，
+            // 否则整屏页只从安全区开始，上下会漏出地图页的边。
+            if pageOpen {
+                UI.bg.ignoresSafeArea()
+            }
+
+            if showFenceList {
+                FenceListPage(onBack: {
+                                  // 列表里可能删掉或关掉了围栏，退出去要把地图上的圈同步掉。
+                                  showFenceList = false
+                                  fences = FenceStore.shared.list
+                              },
+                              onAdd: { openFenceEdit(nil) },
+                              onEdit: { f in openFenceEdit(f) })
+            }
+
+            if showFenceEdit {
+                FenceEditPage(fence: editFence,
+                              carLatLng: carLatLng,
+                              mineLatLng: mineLatLng,
+                              carTitle: carName,
+                              onBack: {
+                                  // 原版这个按钮就叫「返回列表」，所以退出去先看到列表，
+                                  // 不是直接弹回地图页。
+                                  showFenceEdit = false
+                                  fences = FenceStore.shared.list
+                                  showFenceList = true
+                              },
+                              onSaved: {
+                                  showFenceEdit = false
+                                  fences = FenceStore.shared.list
+                                  showFenceList = true
+                                  hint = "围栏已保存"
+                              })
+                    // 从「新建」切到「改另一个」时，SwiftUI 认为还是同一个视图、
+                    // @State 不会重新初始化，会把上一个围栏的名字带过来。用 id 强制重建。
+                    .id(editFence?.id ?? "new-fence")
+            }
+
+            if showHistory {
+                HistoryPage(carCoord: carCoord,
+                            carTitle: carName,
+                            onBack: { showHistory = false })
+            }
+
+            if showGpsSet {
+                GpsSetPage(onBack: { showGpsSet = false })
+            }
         }
         .background(UI.bg)
-        .sheet(isPresented: $showFence) { fenceSheet }
+        .sheet(item: $sheet) { _ in
+            naviSheet
+        }
         .onAppear {
             e.log("▶ 打开地图页")
+            fences = FenceStore.shared.list
             if e.car == nil {
                 e.refreshStatus()
             }
+            updateDistance()
+            checkFences()
+        }
+        .onDisappear {
+            stopTracking()
         }
     }
 
-    private var backButton: some View {
-        Button {
-            isPresented = false
-        } label: {
-            Image(systemName: "chevron.left")
-                .font(.system(size: 16, weight: .bold))
-                .foregroundColor(UI.text)
-                .frame(width: 38, height: 38)
-                .background(UI.card.opacity(0.92))
-                .clipShape(Circle())
-        }
-        .padding(.leading, 12)
-        .padding(.top, 6)
+    private var mapZone: some View {
+        MapCanvas(center: carCoord,
+                  name: carName,
+                  follow: follow,
+                  recenter: recenter,
+                  rings: rings,
+                  track: track,
+                  route: route,
+                  mine: mineCoord,
+                  focusMine: focusMine,
+                  replayDot: replayDot,
+                  satellite: satellite,
+                  traffic: traffic)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .clipped()
     }
 
-    private var rightColumn: some View {
-        HStack {
-            Spacer()
-            VStack(spacing: 10) {
-                roundBtn("location.fill", false) { jumpToMe() }
-                roundBtn("car.fill", follow) {
-                    follow.toggle()
-                    recenter += 1
+    private var panel: some View {
+        VStack(spacing: 9) {
+            HStack(spacing: 6) {
+                panelLink("chevron.left", "返回") { isPresented = false }
+                panelLink("location.fill", "我的位置") { jumpToMe() }
+                panelLink("arrow.clockwise", "刷新") {
+                    hint = "已叫车机上报，几秒后回来看看"
+                    e.manualRefresh()
+                    updateDistance()
                 }
-                roundBtn("circle", circleM > 1) { showFence = true }
-                roundBtn("point.topleft.down.curvedto.point.bottomright.up",
-                         track.count > 1) { loadTrack() }
-                roundBtn("arrow.triangle.turn.up.right.diamond.fill",
-                         route.count > 1) { calcRoute() }
+                panelLink("map.fill", satellite ? "卫星" : "标准") {
+                    satellite = !satellite
+                    hint = satellite ? "已切成卫星图" : "已切回标准图"
+                }
+                panelLink("speedometer", traffic ? "路况开" : "路况") {
+                    traffic = !traffic
+                    hint = traffic ? "已打开实时路况" : "已关闭实时路况"
+                }
+                Spacer(minLength: 0)
             }
-            .padding(.trailing, 12)
-            .padding(.top, 56)
-        }
-        // 不加这句，HStack 只有内容那么高、会垂直居中，五个按钮全挤到屏幕中间
-        .frame(maxHeight: .infinity, alignment: .top)
-    }
 
-    private var bottomPanel: some View {
-        VStack(spacing: 10) {
+            if !hint.isEmpty {
+                Text(hint)
+                    .font(.system(size: 11))
+                    .foregroundColor(UI.text)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 7)
+                    .background(UI.card.opacity(0.96))
+                    .cornerRadius(9)
+            }
+
             infoCard
             actionRow
         }
         .padding(.horizontal, 12)
+        .padding(.top, 4)
         .padding(.bottom, 10)
+        .background(UI.bg)
+    }
+
+    /// 面板顶部的小文字按钮。整段（图标+字+内边距）都能点。
+    private func panelLink(_ icon: String, _ text: String,
+                           _ action: @escaping () -> Void) -> some View {
+        Button {
+            tapFeedback()
+            action()
+        } label: {
+            HStack(spacing: 3) {
+                Image(systemName: icon)
+                    .font(.system(size: 10, weight: .bold))
+                Text(text)
+                    .font(.system(size: 11))
+            }
+            .foregroundColor(tracking && text == "实时追踪" ? UI.ok : UI.dim)
+            .padding(.vertical, 8)
+            .padding(.horizontal, 7)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(PlainButtonStyle())
     }
 
     private var infoCard: some View {
-        VStack(alignment: .leading, spacing: 9) {
+        VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Text(carName)
-                    .font(.system(size: 17, weight: .bold))
+                    .font(.system(size: 16, weight: .bold))
                     .foregroundColor(UI.text)
                     .lineLimit(1)
                 Spacer(minLength: 6)
                 Text(moving ? "行驶" : "静止")
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(.system(size: 11, weight: .semibold))
                     .foregroundColor(.white)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 3)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 2)
                     .background(moving ? UI.accent : UI.ok)
                     .cornerRadius(4)
                 if !tid.isEmpty {
                     Text(tid)
-                        .font(.system(size: 11, design: .monospaced))
+                        .font(.system(size: 10, design: .monospaced))
                         .foregroundColor(UI.dim)
                 }
             }
 
             Divider().background(UI.line)
 
-            HStack(spacing: 16) {
+            HStack(spacing: 14) {
                 infoItem("更新时间", stamp(e.car?.fetchedAt ?? 0))
+            }
+            HStack(spacing: 14) {
                 infoItem("定位时间", stamp(e.car?.reportedAt ?? 0))
+                if !distText.isEmpty {
+                    Text(distText)
+                        .font(.system(size: 11))
+                        .foregroundColor(UI.accent)
+                }
             }
 
-            HStack(spacing: 16) {
+            HStack(spacing: 14) {
                 infoItem("电压", voltText)
                 infoItem("温度", tempText)
+                infoItem("速度", String(e.car?.speedKph ?? 0) + " km/h")
             }
 
             if !e.placeText.isEmpty {
-                HStack(alignment: .top, spacing: 8) {
+                HStack(alignment: .top, spacing: 6) {
                     Text("地址")
-                        .font(.system(size: 11))
+                        .font(.system(size: 10))
                         .foregroundColor(UI.dim)
-                        .frame(width: 48, alignment: .leading)
+                        .frame(width: 34, alignment: .leading)
                     Text(e.placeText)
-                        .font(.system(size: 12))
+                        .font(.system(size: 11))
                         .foregroundColor(UI.text)
                         .fixedSize(horizontal: false, vertical: true)
                     Spacer(minLength: 0)
                 }
             }
         }
-        .padding(13)
+        .padding(12)
         .background(UI.card.opacity(0.96))
         .cornerRadius(14)
     }
 
     private var actionRow: some View {
         HStack(spacing: 0) {
-            actionBtn("location.north.line.fill", "实时追踪", follow) {
-                follow = true
-                recenter += 1
-                e.refreshStatus()
-            }
-            actionBtn("circle", "电子围栏", circleM > 1) { showFence = true }
-            actionBtn("waveform.path.ecg", "历史轨迹", track.count > 1) { loadTrack() }
+            actionBtn("location.north.line.fill", "实时追踪", tracking) { toggleTracking() }
+            actionBtn("circle.dashed", "电子围栏", !fences.isEmpty) { openFence() }
+            actionBtn("play.circle.fill", "历史轨迹", showHistory) { openHistory() }
             actionBtn("arrow.triangle.turn.up.right.diamond.fill", "导航到车",
-                      route.count > 1) { calcRoute() }
-            actionBtn("gearshape.fill", "车辆设置", false) { isPresented = false }
+                      !route.isEmpty) { openNavi() }
+            actionBtn("car.fill", "车辆设置", showGpsSet) { showGpsSet = true }
         }
-        .padding(.vertical, 10)
+        .padding(.vertical, 6)
         .background(UI.card.opacity(0.96))
         .cornerRadius(14)
     }
 
     // MARK: 零件
 
-    private func roundBtn(_ icon: String, _ on: Bool, _ action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Image(systemName: icon)
-                .font(.system(size: 16, weight: .semibold))
-                .foregroundColor(on ? .white : UI.text)
-                .frame(width: 42, height: 42)
-                .background(on ? UI.accent : UI.card.opacity(0.94))
-                .clipShape(Circle())
-                .overlay(Circle().stroke(Color.white.opacity(0.16), lineWidth: 1))
-        }
-    }
-
     private func actionBtn(_ icon: String, _ text: String, _ on: Bool,
                            _ action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            VStack(spacing: 5) {
-                Image(systemName: icon)
-                    .font(.system(size: 17, weight: .semibold))
-                    .foregroundColor(.white)
-                    .frame(width: 44, height: 44)
-                    .background(on ? UI.accent : UI.cardHi)
-                    .clipShape(Circle())
+        Button {
+            tapFeedback()
+            action()
+        } label: {
+            VStack(spacing: 4) {
+                ZStack {
+                    Circle()
+                        .stroke(on ? UI.ok : UI.accent, lineWidth: 2)
+                        .frame(width: 42, height: 42)
+                    Image(systemName: icon)
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundColor(on ? UI.ok : UI.accent)
+                }
                 Text(text)
                     .font(.system(size: 10))
-                    .foregroundColor(on ? UI.text : UI.dim)
+                    .foregroundColor(on ? UI.ok : UI.text)
                     .lineLimit(1)
             }
+            // 五等分整格都能点。少了这句，只有那 42 点的圆和几个字能点中。
             .frame(maxWidth: .infinity)
+            .padding(.vertical, 4)
+            .contentShape(Rectangle())
         }
+        .buttonStyle(PlainButtonStyle())
     }
 
     private func infoItem(_ k: String, _ v: String) -> some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 5) {
             Text(k)
-                .font(.system(size: 11))
+                .font(.system(size: 10))
                 .foregroundColor(UI.dim)
             Text(v)
-                .font(.system(size: 12, design: .monospaced))
+                .font(.system(size: 11, design: .monospaced))
                 .foregroundColor(UI.text)
             Spacer(minLength: 0)
         }
     }
 
-    private var fenceSheet: some View {
-        VStack(alignment: .leading, spacing: 14) {
+    /// 每按一下就轻轻震一下。有震动说明点击确实收到了。
+    private func tapFeedback() {
+        let g = UIImpactFeedbackGenerator(style: .light)
+        g.prepare()
+        g.impactOccurred()
+    }
+
+    // MARK: 实时追踪（照原版 TrackFlowController）
+
+    /// 原版是定时器循环：安卓每 60 秒一轮（0xEA60），先叫车机定位、
+    /// 等 1.9 秒再读状态；地图跟着车走，同时算手机到车的距离。
+    ///
+    /// iOS 包的主二进制里没有 303598 这个码（那条是安卓侧的），所以这里
+    /// 用 203100 读状态这一半，不额外发指令 —— 宁可少发，不要乱发。
+    private func toggleTracking() {
+        if tracking {
+            stopTracking()
+            hint = "已停止实时追踪"
+            e.log("▶ 停止实时追踪")
+            return
+        }
+        tracking = true
+        follow = true
+        recenter += 1
+        hint = "实时追踪已开 · 每 60 秒自动刷新一次车辆位置"
+        e.log("▶ 开始实时追踪（60 秒一轮）")
+        e.refreshStatus()
+        trackTimer = Timer.scheduledTimer(withTimeInterval: 60.0, repeats: true) { _ in
+            // 闭包里一律显式写 self：SXKC 是 struct，Swift 在 escaping 闭包中
+            // 不允许裸引用成员。
+            DispatchQueue.main.async {
+                self.e.refreshStatus()
+                self.updateDistance()
+                self.checkFences()
+            }
+        }
+    }
+
+    private func stopTracking() {
+        tracking = false
+        if let t = trackTimer {
+            t.invalidate()
+            trackTimer = nil
+        }
+    }
+
+    private func updateDistance() {
+        guard let km = phoneCarKm else {
+            distText = ""
+            return
+        }
+        if km < 1 {
+            distText = String(format: "我离车 %d 米", Int(km * 1000))
+        } else {
+            distText = String(format: "我离车 %.1f 公里", km)
+        }
+    }
+
+    // MARK: 电子围栏（照原版 GeoFenceController）
+
+    /// 原版从地图页点「电子围栏」：一个围栏都没有时直接进编辑页新建；
+    /// 已经有了就先出列表（列表右上角加号同样能新建）。
+    private func openFence() {
+        fences = FenceStore.shared.list
+        if fences.isEmpty {
+            openFenceEdit(nil)
+        } else {
+            showFenceList = true
+        }
+    }
+
+    private func openFenceEdit(_ f: FenceStore.Fence?) {
+        if f == nil, carLatLng == nil, mineLatLng == nil {
+            hint = "还没有车辆坐标，先点「刷新」再建围栏"
+            return
+        }
+        editFence = f
+        showFenceEdit = true
+    }
+
+    /// 越界判定。原版由服务端判、推 ActionMapWarn；这里本地判，
+    /// App 没开的时候就断（如实说明）。
+    ///
+    /// 1.39：按每个围栏自己的两个开关分别判 —— 入圈报警 / 出圈报警，
+    /// 跟原版编辑页那两行 Toggle 一一对应。第一次见到这个围栏只记方向、
+    /// 不报警，否则一打开地图页就会因为"本来就在圈外"炸一条通知出来。
+    private func checkFences() {
+        guard let p = carLatLng else { return }
+        let car = CLLocation(latitude: p.0, longitude: p.1)
+        for f in fences {
+            if !f.on { continue }
+            let d = car.distance(from: CLLocation(latitude: f.lat, longitude: f.lng))
+            let inside = d <= f.radius
+            let was = inFence[f.id]
+            inFence[f.id] = inside
+            if was == nil { continue }
+            if was == true, !inside, f.outAlert {
+                alert("车辆离开围栏",
+                      "「" + f.name + "」已出圈，直线距离 " + String(Int(d)) + " 米")
+            }
+            if was == false, inside, f.inAlert {
+                alert("车辆进入围栏",
+                      "「" + f.name + "」已进圈，直线距离 " + String(Int(d)) + " 米")
+            }
+        }
+    }
+
+    private func alert(_ title: String, _ body: String) {
+        let c = UNMutableNotificationContent()
+        c.title = title
+        c.body = body
+        c.sound = .default
+        let r = UNNotificationRequest(identifier: "fence-" + UUID().uuidString,
+                                      content: c, trigger: nil)
+        UNUserNotificationCenter.current().add(r, withCompletionHandler: nil)
+        hint = title + "：" + body
+        e.log("⚠ " + title + " " + body)
+    }
+
+    // MARK: 历史轨迹（照原版 HistoryListView）
+
+    /// 整屏的轨迹页在 MapPanels.swift 的 HistoryPage 里（日期页签 + 四项小结 +
+    /// 起止地点 + 地图回放）。这里只负责把当天已经画在地图上的线清掉再进去，
+    /// 否则用户从轨迹页退回来，地图上还挂着上一次那条线。
+    private func openHistory() {
+        track = []
+        replayDot = nil
+        showHistory = true
+    }
+
+    // MARK: 导航到车（照原版 ActionMapNavi）
+
+    private func openNavi() {
+        if carCoord == nil {
+            hint = "还没有车辆坐标，先点「刷新」"
+            return
+        }
+        sheet = .navi
+    }
+
+    private var naviSheet: some View {
+        VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Text("电子围栏")
+                Text("导航到车")
                     .font(.system(size: 18, weight: .bold))
                     .foregroundColor(UI.text)
                 Spacer()
-                Button("关闭") { showFence = false }
+                Button("关闭") { sheet = nil }
                     .foregroundColor(UI.accent)
             }
 
-            Text("以车为中心画一个圈，车出了圈地图上一眼能看出来。")
-                .font(.system(size: 12))
+            Text("原版是唤起手机里装的地图 App（高德 / 百度 / 腾讯），直接进「到车」的驾车路线。")
+                .font(.system(size: 11))
                 .foregroundColor(UI.dim)
+                .fixedSize(horizontal: false, vertical: true)
 
-            ForEach([500.0, 1000.0, 2000.0, 5000.0], id: \.self) { r in
-                Button {
-                    circleM = r
-                    follow = false
-                    hint = "围栏半径 \(Int(r)) 米"
-                    showFence = false
-                } label: {
-                    HStack {
-                        Text(r < 1000 ? "\(Int(r)) 米" : "\(Int(r / 1000)) 公里")
-                            .font(.system(size: 14))
-                            .foregroundColor(UI.text)
-                        Spacer()
-                        if Int(circleM) == Int(r) {
-                            Image(systemName: "checkmark")
-                                .font(.system(size: 13, weight: .bold))
-                                .foregroundColor(UI.accent)
-                        }
-                    }
-                    .padding(.vertical, 12)
-                    .padding(.horizontal, 14)
-                    .background(Int(circleM) == Int(r) ? UI.cardHi : UI.card)
-                    .cornerRadius(10)
-                }
+            naviRow("map.fill", "在 App 内算路线", "苹果算路，不跳出去") {
+                sheet = nil
+                calcRouteInApp()
             }
-
-            Button {
-                circleM = 0
-                showFence = false
-                hint = "围栏已关闭"
-            } label: {
-                Text("不画围栏")
-                    .font(.system(size: 14))
-                    .foregroundColor(UI.bad)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 12)
-                    .background(UI.card)
-                    .cornerRadius(10)
+            naviRow("location.circle.fill", "用苹果地图打开", "系统地图，可导航可限速提醒") {
+                sheet = nil
+                openAppleMap()
+            }
+            naviRow("car.circle.fill", "用高德地图打开", "装了高德才会成功") {
+                sheet = nil
+                openThirdMap("iosamap://path?sourceApplication=SXKC&dlat=",
+                             "dname=", "高德")
+            }
+            naviRow("mappin.circle.fill", "用百度地图打开", "装了百度才会成功") {
+                sheet = nil
+                openThirdMap("baidumap://map/direction?mode=driving&destination=latlng:",
+                             "|name=", "百度")
+            }
+            naviRow("mappin.and.ellipse", "用腾讯地图打开", "装了腾讯才会成功") {
+                sheet = nil
+                openThirdMap("qqmap://map/routeplan?type=drive&to=",
+                             "", "腾讯")
             }
 
             Spacer(minLength: 0)
         }
-        .padding(20)
+        .padding(18)
         .background(UI.bg.ignoresSafeArea())
     }
 
-    // MARK: 动作
-
-    private func jumpToMe() {
-        guard mineCoord != nil else {
-            hint = "还没拿到手机定位：去「定位」卡片把开关打开"
-            return
+    private func naviRow(_ icon: String, _ title: String, _ sub: String,
+                         _ action: @escaping () -> Void) -> some View {
+        Button {
+            tapFeedback()
+            action()
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: icon)
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundColor(UI.accent)
+                    .frame(width: 24)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(.system(size: 14))
+                        .foregroundColor(UI.text)
+                    Text(sub)
+                        .font(.system(size: 11))
+                        .foregroundColor(UI.dim)
+                }
+                Spacer(minLength: 0)
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundColor(UI.dim.opacity(0.6))
+            }
+            .padding(.vertical, 12)
+            .padding(.horizontal, 14)
+            .background(UI.card)
+            .cornerRadius(10)
+            .contentShape(Rectangle())
         }
-        focusMine += 1
-        follow = false
-        hint = "已回到我的位置"
+        .buttonStyle(PlainButtonStyle())
     }
 
-    private func loadTrack() {
-        let raw = TrackStore.shared.points(daysBack: 1)
-        if raw.count < 2 {
-            hint = "还没有轨迹点。车每上报一次位置就记一个，开出去转一圈再回来看。"
-            return
-        }
-        // 磁盘里存的是原始 GPS 坐标（存原值，换算法了也不用重写历史），
-        // 画线之前统一换算成 GCJ-02，否则整条轨迹会和车标差出几百米。
-        let pts = raw.map { MapGeo.display($0) }
-        track = pts
-        follow = false
-        hint = "轨迹已载入 \(pts.count) 个点（今天 + 昨天）"
-        e.log("▶ 载入轨迹 \(pts.count) 点")
+    /// 苹果地图：直接交给系统，不用拼 scheme。
+    private func openAppleMap() {
+        guard let p = carLatLng else { return }
+        let g = MapGeo.display(lat: p.0, lng: p.1)
+        let item = MKMapItem(placemark: MKPlacemark(coordinate: g))
+        item.name = carName
+        item.openInMaps(launchOptions: [
+            MKLaunchOptionsDirectionsModeKey: MKLaunchOptionsDirectionsModeDriving
+        ])
+        e.log("▶ 用苹果地图导航到车")
     }
 
-    private func calcRoute() {
+    /// 第三方地图。手机没装时 open 会失败，所以用 completion 判。
+    /// 坐标给 GCJ-02：这几个地图 App 在中国大陆都按 GCJ 理解传入值。
+    private func openThirdMap(_ head: String, _ tail: String, _ label: String) {
+        guard let p = carLatLng else { return }
+        let g = MapGeo.display(lat: p.0, lng: p.1)
+        let lat = String(format: "%.6f", g.latitude)
+        let lng = String(format: "%.6f", g.longitude)
+
+        // 车名一般是中文，直接塞进 URL 会让 URL(string:) 返回 nil
+        // （iOS 9 起严格校验），所以名字先单独做百分号编码。
+        let qName = carName.addingPercentEncoding(
+            withAllowedCharacters: .urlQueryAllowed) ?? "car"
+
+        var s = ""
+        if label == "高德" {
+            s = head + lat + "&dlon=" + lng + "&" + tail + qName + "&dev=0&t=0"
+        } else if label == "百度" {
+            s = head + lat + "," + lng + tail + qName
+                + "&coord_type=gcj02&src=ios.sxkc"
+        } else {
+            s = head + qName + "&tocoord=" + lat + "," + lng + "&referer=sxkc"
+        }
+
+        guard let url = URL(string: s) else {
+            hint = label + "的地图链接拼错了"
+            return
+        }
+        UIApplication.shared.open(url, options: [:]) { ok in
+            if !ok {
+                self.hint = "没打开" + label + "地图 —— 手机里可能没装这个 App"
+            } else {
+                self.hint = "已用" + label + "地图打开"
+            }
+        }
+        e.log("▶ 唤起" + label + "地图：" + s)
+    }
+
+    private func calcRouteInApp() {
         guard let dst = carCoord else {
-            hint = "还没有车辆坐标，先点一次刷新"
+            hint = "还没有车辆坐标，先点「刷新」"
             return
         }
         guard let src = mineCoord else {
-            hint = "还没拿到手机定位：去「定位」卡片把开关打开"
+            hint = "还没拿到手机定位：回主界面把「定位」卡片的开关打开"
             return
         }
         hint = "正在算路…"
@@ -8608,21 +9244,1042 @@ struct MapPage: View {
         MKDirections(request: req).calculate { resp, err in
             DispatchQueue.main.async {
                 guard let r = resp?.routes.first else {
-                    hint = "没算出路：" + (err?.localizedDescription ?? "附近没有可用道路")
+                    self.hint = "没算出路：" + (err?.localizedDescription ?? "附近没有可用道路")
                     return
                 }
                 var coords = [CLLocationCoordinate2D](repeating: kCLLocationCoordinate2DInvalid,
                                                       count: r.polyline.pointCount)
                 r.polyline.getCoordinates(&coords,
                                           range: NSRange(location: 0, length: r.polyline.pointCount))
-                route = coords
-                follow = false
+                self.route = coords
+                self.follow = false
                 let km = r.distance / 1000.0
                 let mins = Int(r.expectedTravelTime / 60.0)
-                hint = String(format: "到车 %.1f 公里 · 约 %d 分钟", km, max(1, mins))
-                e.log("▶ 导航到车 " + hint)
+                self.hint = String(format: "到车 %.1f 公里 · 约 %d 分钟", km, max(1, mins))
+                self.e.log("▶ 导航到车 " + self.hint)
             }
         }
+    }
+
+    // MARK: 动作
+
+    private func jumpToMe() {
+        guard mineCoord != nil else {
+            hint = "还没拿到手机定位：回主界面把「定位」卡片的开关打开"
+            return
+        }
+        focusMine += 1
+        follow = false
+        hint = "镜头已跳到我的位置"
+    }
+}
+
+
+// ==========================================================================
+//  SXKC/UI/MapPanels.swift  ——  整屏页面：电子围栏、历史轨迹、GPS 功能设置
+// ==========================================================================
+
+//
+//  MapPanels.swift
+//  1.39：三个整屏页面 —— 电子围栏、历史轨迹、GPS 功能设置
+//
+//  这三个页面是照着原版 iOS（顺心控车 1.0.6）的截图 1:1 复刻的：
+//
+//   1. 电子围栏（fence）
+//      整屏地图 + 底部面板：返回列表 / 保存 / 半径滑杆（0.5KM）/ 围栏名称 /
+//      入围栏报警 / 出围栏报警。字段和安卓包里 GeoFenceController 用的那一组
+//      完全对得上：geo.circle.lat / geo.circle.lng / geo.circle.radius /
+//      geo.circle.reset / geo.geoname。
+//
+//   2. 历史轨迹（track）
+//      顶部「切换」+ 横向日期页签（日期 + 当天里程）+ 四项小结（里程 / 时长 /
+//      均速 / 最高速）+ 开始时间与位置 + 结束时间与位置。对应 HistoryListView
+//      的 txndate / times / avgspd / maxspd / miles 五个字段。
+//
+//   3. GPS 功能设置（devcfg）
+//      GPS 开关 / 电子围栏 / 隐私模式 三行开关 + 查询 / 保存两个按钮。
+//      对应安卓包里 DataHelper.getcfg(dev, "config.devcfg.privacy") 和
+//      parseVstStatus 里读的 gps_opn / gps_cls / gps_loc 三个状态位。
+//
+//  布局按截图，配色沿用本项目的深色主题 —— 其余界面都是深色，这里单独做白底
+//  会跟整个 App 割裂。
+//
+//  另外有一处刻意和原版不一样、必须写清楚：
+//  原版左侧那两个浮在地图上的圆按钮，这里挪进了底部面板。原因在 1.37 已经踩过：
+//  SwiftUI 画的按钮不是 UIView，全屏 MKMapView 在下面时，触摸会先被地图的手势
+//  识别器接走，表现就是「点了没反应」。放进面板里就不抢触摸了。
+//
+
+
+// MARK: - 公共零件
+
+/// 整屏页面的顶栏：左返回箭头、居中标题、右侧一个动作（文字或图标）。
+/// 原版三个页面都是这个样子，抽出来省得各写一遍。
+struct PageTopBar: View {
+
+    var title: String
+    var rightText: String = ""
+    var rightIcon: String = ""
+    var onBack: () -> Void
+    var onRight: (() -> Void)? = nil
+
+    var body: some View {
+        ZStack {
+            Text(title)
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundColor(.white)
+
+            HStack(spacing: 0) {
+                Button {
+                    onBack()
+                } label: {
+                    Image(systemName: "arrow.left")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundColor(.white)
+                        .frame(width: 48, height: 48)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(PlainButtonStyle())
+
+                Spacer(minLength: 0)
+
+                if let act = onRight {
+                    Button {
+                        act()
+                    } label: {
+                        rightLabel
+                            .frame(width: 48, height: 48)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(PlainButtonStyle())
+                }
+            }
+        }
+        .frame(height: 48)
+        .background(Color(red: 0.105, green: 0.105, blue: 0.118))
+    }
+
+    @ViewBuilder
+    private var rightLabel: some View {
+        if rightText.isEmpty {
+            Image(systemName: rightIcon.isEmpty ? "plus" : rightIcon)
+                .font(.system(size: 19, weight: .semibold))
+                .foregroundColor(.white)
+        } else {
+            Text(rightText)
+                .font(.system(size: 15))
+                .foregroundColor(.white)
+        }
+    }
+}
+
+/// 毫秒时间戳 → "2026-11-14 01:10:59"（原版列表里就是这个格式）。
+func mpStamp(_ ms: Int64) -> String {
+    if ms <= 0 { return "--" }
+    let sec = ms > 100_000_000_000 ? ms / 1000 : ms
+    let f = DateFormatter()
+    f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+    f.locale = Locale(identifier: "en_US_POSIX")
+    return f.string(from: Date(timeIntervalSince1970: TimeInterval(sec)))
+}
+
+/// "yyyyMMdd" → "11-14"（日期页签上那一行）。
+func mpMonthDay(_ key: String) -> String {
+    if key.count >= 8 {
+        let m = key.index(key.startIndex, offsetBy: 4)
+        let d = key.index(key.startIndex, offsetBy: 6)
+        return String(key[m..<d]) + "-" + String(key[d...])
+    }
+    return key
+}
+
+// MARK: - 1. 电子围栏编辑页
+
+/// 整屏地图 + 底部面板。新建和修改用的是同一个页面：传 fence 就是改，传 nil 就是新建。
+struct FenceEditPage: View {
+
+    @EnvironmentObject var e: AutoEngine
+
+    private let editingId: String?
+    private let carLatLng: (Double, Double)?
+    private let mineLatLng: (Double, Double)?
+    private let carTitle: String
+    private let onBack: () -> Void
+    private let onSaved: () -> Void
+
+    @State private var name: String
+    @State private var radiusKm: Double
+    @State private var centerLat: Double
+    @State private var centerLng: Double
+    @State private var inAlert: Bool
+    @State private var outAlert: Bool
+    @State private var tip = ""
+
+    // 视野控制：recenter 变一次就是把镜头拉回车；focusMine 变一次是拉回我的位置。
+    @State private var recenter = 0
+    @State private var focusMine = 0
+
+    init(fence: FenceStore.Fence?,
+         carLatLng: (Double, Double)?,
+         mineLatLng: (Double, Double)?,
+         carTitle: String,
+         onBack: @escaping () -> Void,
+         onSaved: @escaping () -> Void) {
+
+        self.editingId = fence?.id
+        self.carLatLng = carLatLng
+        self.mineLatLng = mineLatLng
+        self.carTitle = carTitle
+        self.onBack = onBack
+        self.onSaved = onSaved
+
+        let seed = carLatLng ?? mineLatLng ?? (0.0, 0.0)
+        _name = State(initialValue: fence?.name ?? FenceStore.shared.nextName())
+        _radiusKm = State(initialValue: (fence?.radius ?? 500.0) / 1000.0)
+        _centerLat = State(initialValue: fence?.lat ?? seed.0)
+        _centerLng = State(initialValue: fence?.lng ?? seed.1)
+        _inAlert = State(initialValue: fence?.inAlert ?? false)
+        _outAlert = State(initialValue: fence?.outAlert ?? true)
+    }
+
+    // MARK: 坐标
+
+    private var carCoord: CLLocationCoordinate2D? {
+        guard let p = carLatLng, p.0 != 0, p.1 != 0 else { return nil }
+        return MapGeo.display(lat: p.0, lng: p.1)
+    }
+
+    private var mineCoord: CLLocationCoordinate2D? {
+        guard let p = mineLatLng, p.0 != 0, p.1 != 0 else { return nil }
+        return MapGeo.display(lat: p.0, lng: p.1)
+    }
+
+    /// 地图镜头。有车就对着车，没车就对着圆心 —— 否则会飘到几内亚湾。
+    private var mapCenter: CLLocationCoordinate2D {
+        if let c = carCoord { return c }
+        if centerLat != 0 || centerLng != 0 {
+            return MapGeo.display(lat: centerLat, lng: centerLng)
+        }
+        return CLLocationCoordinate2D(latitude: 24.8741, longitude: 118.6757)
+    }
+
+    private var rings: [FenceRing] {
+        let c = MapGeo.display(lat: centerLat, lng: centerLng)
+        let key = String(format: "edit,%.6f,%.6f,%.0f",
+                         c.latitude, c.longitude, radiusKm * 1000.0)
+        return [FenceRing(key: key, center: c, radius: radiusKm * 1000.0, on: true)]
+    }
+
+    // MARK: 界面
+
+    var body: some View {
+        VStack(spacing: 0) {
+            PageTopBar(title: "电子围栏", onBack: onBack)
+
+            MapCanvas(center: mapCenter,
+                      name: carTitle,
+                      follow: false,
+                      recenter: recenter,
+                      rings: rings,
+                      track: [],
+                      route: [],
+                      mine: mineCoord,
+                      focusMine: focusMine,
+                      replayDot: nil,
+                      satellite: false,
+                      traffic: false)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .clipped()
+
+            bottomPanel
+        }
+        .background(UI.bg)
+    }
+
+    private var bottomPanel: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Button {
+                    onBack()
+                } label: {
+                    Text("返回列表")
+                        .font(.system(size: 16))
+                        .foregroundColor(UI.accent)
+                        .padding(.vertical, 11)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(PlainButtonStyle())
+
+                Spacer(minLength: 0)
+
+                roundBtn("location.fill") { centerOnMine() }
+                roundBtn("car.fill") { centerOnCar() }
+
+                Spacer(minLength: 0)
+
+                Button {
+                    save()
+                } label: {
+                    Text("保存")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundColor(UI.accent)
+                        .padding(.vertical, 11)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(PlainButtonStyle())
+            }
+            .padding(.horizontal, 12)
+
+            rowLine
+
+            // 半径：原版滑杆右端直接跟一个「0.5KM」。范围 0.1~5.0 公里、步长 0.1，
+            // 和 GeoFenceController 那边默认 500 米、上限 5000 米、步长 100 一致。
+            HStack(spacing: 10) {
+                Text("半径")
+                    .font(.system(size: 15))
+                    .foregroundColor(UI.text)
+                    .frame(width: 68, alignment: .leading)
+
+                Slider(value: $radiusKm, in: 0.1...5.0, step: 0.1)
+                    .accentColor(UI.accent)
+
+                Text(String(format: "%.1fKM", radiusKm))
+                    .font(.system(size: 14))
+                    .foregroundColor(UI.text)
+                    .frame(width: 62, alignment: .trailing)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 4)
+
+            rowLine
+
+            HStack(spacing: 10) {
+                Text("围栏名称")
+                    .font(.system(size: 15))
+                    .foregroundColor(UI.text)
+                    .frame(width: 68, alignment: .leading)
+
+                TextField("围栏名称", text: $name)
+                    .font(.system(size: 15))
+                    .foregroundColor(UI.text)
+                    .accentColor(UI.accent)
+                    .padding(.vertical, 9)
+                    .padding(.horizontal, 10)
+                    .background(UI.cardHi)
+                    .cornerRadius(7)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 4)
+
+            rowLine
+
+            switchRow("入围栏报警", $inAlert)
+            rowLine
+            switchRow("出围栏报警", $outAlert)
+
+            if !tip.isEmpty {
+                Text(tip)
+                    .font(.system(size: 11))
+                    .foregroundColor(UI.dim)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 14)
+                    .padding(.bottom, 4)
+            }
+        }
+        .padding(.top, 2)
+        .padding(.bottom, 6)
+        .background(UI.card)
+    }
+
+    private var rowLine: some View {
+        Rectangle()
+            .fill(UI.line)
+            .frame(height: 1)
+            .padding(.leading, 14)
+    }
+
+    private func roundBtn(_ icon: String, _ act: @escaping () -> Void) -> some View {
+        Button {
+            act()
+        } label: {
+            Image(systemName: icon)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundColor(UI.accent)
+                .frame(width: 34, height: 34)
+                .background(UI.cardHi)
+                .clipShape(Circle())
+                .contentShape(Circle())
+        }
+        .buttonStyle(PlainButtonStyle())
+    }
+
+    private func switchRow(_ label: String, _ bind: Binding<Bool>) -> some View {
+        HStack(spacing: 10) {
+            Text(label)
+                .font(.system(size: 15))
+                .foregroundColor(UI.text)
+            Spacer(minLength: 0)
+            Toggle("", isOn: bind)
+                .labelsHidden()
+                .toggleStyle(SwitchToggleStyle(tint: UI.accent))
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 7)
+    }
+
+    // MARK: 动作
+
+    private func centerOnCar() {
+        guard let p = carLatLng, p.0 != 0 else {
+            tip = "还没拿到车的位置，回地图页点一下「刷新」"
+            return
+        }
+        centerLat = p.0
+        centerLng = p.1
+        recenter += 1
+        tip = "圆心已放到车的位置"
+    }
+
+    private func centerOnMine() {
+        guard let p = mineLatLng, p.0 != 0 else {
+            tip = "还没拿到手机定位，回主界面把「定位」打开"
+            return
+        }
+        centerLat = p.0
+        centerLng = p.1
+        focusMine += 1
+        tip = "圆心已放到我的位置"
+    }
+
+    private func save() {
+        if centerLat == 0 && centerLng == 0 {
+            tip = "还没有圆心：先点上面的手机或车图标"
+            return
+        }
+        let raw = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let finalName = raw.isEmpty ? FenceStore.shared.nextName() : raw
+
+        let f = FenceStore.Fence(id: editingId ?? UUID().uuidString,
+                                 name: finalName,
+                                 lat: centerLat,
+                                 lng: centerLng,
+                                 radius: radiusKm * 1000.0,
+                                 on: true,
+                                 inAlert: inAlert,
+                                 outAlert: outAlert)
+        FenceStore.shared.save(f)
+        e.log("▶ 保存围栏「" + finalName + "」半径 "
+              + String(Int(radiusKm * 1000)) + " 米")
+        onSaved()
+    }
+}
+
+// MARK: - 2. 电子围栏列表页
+
+/// 原版从地图页点「电子围栏」先进这张列表，右上角加号进编辑页。
+struct FenceListPage: View {
+
+    @EnvironmentObject var e: AutoEngine
+
+    var onBack: () -> Void
+    var onAdd: () -> Void
+    var onEdit: (FenceStore.Fence) -> Void
+
+    @State private var list: [FenceStore.Fence] = []
+
+    var body: some View {
+        VStack(spacing: 0) {
+            PageTopBar(title: "电子围栏",
+                       rightIcon: "plus",
+                       onBack: onBack,
+                       onRight: onAdd)
+
+            ScrollView {
+                VStack(spacing: 10) {
+                    if list.isEmpty {
+                        VStack(spacing: 10) {
+                            Image(systemName: "circle.dashed")
+                                .font(.system(size: 34))
+                                .foregroundColor(UI.dim)
+                            Text("还没有围栏")
+                                .font(.system(size: 14))
+                                .foregroundColor(UI.text)
+                            Text("点右上角「+」新建一个，圆心默认放在车的位置")
+                                .font(.system(size: 12))
+                                .foregroundColor(UI.dim)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 60)
+                    } else {
+                        ForEach(list) { f in
+                            fenceRow(f)
+                        }
+                        Text("点一条进去改半径和报警；长按删除。")
+                            .font(.system(size: 11))
+                            .foregroundColor(UI.dim)
+                            .padding(.top, 6)
+                    }
+                }
+                .padding(14)
+            }
+        }
+        .background(UI.bg)
+        .onAppear {
+            FenceStore.shared.reload()
+            list = FenceStore.shared.list
+        }
+    }
+
+    private func fenceRow(_ f: FenceStore.Fence) -> some View {
+        // 整行不用 Button 包：里面已经有一个 Toggle 了，Button 套 Toggle 的时候
+        // 点开关会连带把行点击也触发一次（一按就跳进编辑页，开关反而拨不动）。
+        HStack(spacing: 10) {
+            Image(systemName: "circle.dashed")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundColor(f.on ? UI.ok : UI.dim)
+                .frame(width: 24)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(f.name)
+                    .font(.system(size: 15))
+                    .foregroundColor(UI.text)
+                Text(radiusText(f.radius) + " · "
+                     + (f.inAlert ? "入圈报警" : "入圈静默") + " / "
+                     + (f.outAlert ? "出圈报警" : "出圈静默"))
+                    .font(.system(size: 11))
+                    .foregroundColor(UI.dim)
+            }
+
+            Spacer(minLength: 0)
+
+            Toggle("", isOn: Binding(
+                get: { f.on },
+                set: { v in
+                    FenceStore.shared.setOn(id: f.id, v)
+                    list = FenceStore.shared.list
+                }))
+                .labelsHidden()
+                .toggleStyle(SwitchToggleStyle(tint: UI.ok))
+
+            Image(systemName: "chevron.right")
+                .font(.system(size: 11, weight: .bold))
+                .foregroundColor(UI.dim.opacity(0.6))
+        }
+        .padding(12)
+        .background(UI.card)
+        .cornerRadius(11)
+        .contentShape(Rectangle())
+        .onTapGesture { onEdit(f) }
+        .contextMenu {
+            Button("删除这个围栏") {
+                FenceStore.shared.remove(id: f.id)
+                list = FenceStore.shared.list
+                e.log("▶ 删除围栏「" + f.name + "」")
+            }
+        }
+    }
+
+    private func radiusText(_ m: Double) -> String {
+        if m >= 1000 {
+            return String(format: "%.1f 公里", m / 1000.0)
+        }
+        return String(Int(m)) + " 米"
+    }
+}
+
+// MARK: - 3. 历史轨迹页
+
+/// 原版：顶部「切换」，下面一排日期页签（每个页签两行：日期 + 当天里程），
+/// 选中那天在下面出四项小结和起止时间地点。「切换」在本版是列表 ↔ 地图。
+struct HistoryPage: View {
+
+    @EnvironmentObject var e: AutoEngine
+
+    var carCoord: CLLocationCoordinate2D?
+    var carTitle: String
+    var onBack: () -> Void
+
+    @State private var days: [TrackStore.Day] = []
+    @State private var sel = 0
+    @State private var mapMode = false
+
+    @State private var raw: [TrackStore.Pt] = []
+    @State private var pts: [CLLocationCoordinate2D] = []
+    @State private var idx: Double = 0
+    @State private var playing = false
+    @State private var timer: Timer? = nil
+
+    // 逆地理结果缓存，key 是「天 + 起止标记」。
+    @State private var places: [String: String] = [:]
+
+    var body: some View {
+        VStack(spacing: 0) {
+            PageTopBar(title: "历史轨迹",
+                       rightText: "切换",
+                       onBack: onBack,
+                       onRight: { mapMode = !mapMode })
+
+            if days.isEmpty {
+                emptyView
+            } else {
+                dayTabs
+                ScrollView {
+                    VStack(spacing: 12) {
+                        if mapMode { mapBox }
+                        summaryBox
+                        placeBox
+                        if mapMode { replayBar }
+                        footNote
+                    }
+                    .padding(14)
+                }
+            }
+        }
+        .background(UI.bg)
+        .onAppear { load() }
+        .onDisappear { stopTimer() }
+    }
+
+    // MARK: 顶部页签
+
+    private var dayTabs: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 0) {
+                // 不用 Array(enumerated()) —— 它的元素是元组，而 KeyPath 不能
+                // 指向元组成员（\.element.key 编译不过）。用下标最省事。
+                ForEach(days.indices, id: \.self) { i in
+                    tabCell(i, days[i])
+                }
+            }
+            .padding(.horizontal, 4)
+        }
+        .frame(height: 62)
+        .background(UI.card)
+    }
+
+    private func tabCell(_ i: Int, _ d: TrackStore.Day) -> some View {
+        let on = (i == sel)
+        return Button {
+            sel = i
+            loadDay()
+        } label: {
+            VStack(spacing: 2) {
+                Text(mpMonthDay(d.key))
+                    .font(.system(size: 15, weight: on ? .semibold : .regular))
+                    .foregroundColor(on ? UI.bad : UI.text)
+                Text(String(format: "%.2fKM", d.km))
+                    .font(.system(size: 11))
+                    .foregroundColor(on ? UI.bad : UI.dim)
+            }
+            .frame(width: 76)
+            .padding(.vertical, 6)
+            .contentShape(Rectangle())
+            .overlay(
+                Rectangle()
+                    .fill(on ? UI.bad : Color.clear)
+                    .frame(height: 2),
+                alignment: .bottom
+            )
+        }
+        .buttonStyle(PlainButtonStyle())
+    }
+
+    // MARK: 当天小结（截图里那一行四个数）
+
+    private var summaryBox: some View {
+        HStack(spacing: 0) {
+            statCell("flag.fill", kmText, UI.text)
+            statCell("clock", durText, UI.text)
+            statCell("speedometer", avgText, UI.text)
+            statCell("exclamationmark.circle.fill", maxText, UI.bad)
+        }
+        .padding(.vertical, 12)
+        .background(UI.card)
+        .cornerRadius(11)
+    }
+
+    private func statCell(_ icon: String, _ text: String, _ color: Color) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: icon)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(color)
+            Text(text)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundColor(color)
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    // MARK: 起止时间与位置
+
+    private var placeBox: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("开始时间：" + mpStamp(cur?.startAt ?? 0))
+                .font(.system(size: 13))
+                .foregroundColor(UI.text)
+            placeLine(placeKey(0))
+
+            Rectangle().fill(UI.line).frame(height: 1).padding(.vertical, 2)
+
+            Text("结束时间：" + mpStamp(cur?.endAt ?? 0))
+                .font(.system(size: 13))
+                .foregroundColor(UI.text)
+            placeLine(placeKey(1))
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12)
+        .background(UI.card)
+        .cornerRadius(11)
+    }
+
+    private func placeLine(_ key: String) -> some View {
+        HStack(alignment: .top, spacing: 0) {
+            Text("位置：")
+                .font(.system(size: 12))
+                .foregroundColor(UI.dim)
+            Text(places[key] ?? "定位中…")
+                .font(.system(size: 12))
+                .foregroundColor(places[key] == nil ? UI.dim : UI.text)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        }
+    }
+
+    // MARK: 地图（「切换」之后）
+
+    private var mapBox: some View {
+        MapCanvas(center: nil,
+                  name: carTitle,
+                  follow: false,
+                  recenter: 0,
+                  rings: [],
+                  track: pts,
+                  route: [],
+                  mine: nil,
+                  focusMine: 0,
+                  replayDot: curCoord,
+                  satellite: false,
+                  traffic: false,
+                  fit: pts)
+            .frame(height: 260)
+            .clipped()
+            .cornerRadius(11)
+    }
+
+    private var replayBar: some View {
+        VStack(spacing: 6) {
+            HStack(spacing: 10) {
+                Button {
+                    togglePlay()
+                } label: {
+                    Image(systemName: playing ? "pause.fill" : "play.fill")
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundColor(.white)
+                        .frame(width: 34, height: 34)
+                        .background(UI.accent)
+                        .clipShape(Circle())
+                        .contentShape(Circle())
+                }
+                .buttonStyle(PlainButtonStyle())
+
+                Slider(value: Binding(
+                    get: { idx },
+                    set: { v in
+                        idx = v
+                        stopTimer()
+                    }), in: 0...Double(max(1, raw.count - 1)))
+                    .accentColor(UI.warn)
+
+                Text(kphText)
+                    .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                    .foregroundColor(UI.warn)
+                    .frame(width: 66, alignment: .trailing)
+            }
+
+            HStack {
+                Text(curPt == nil ? "--" : mpStamp(curPt?.ts ?? 0))
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(UI.dim)
+                Spacer(minLength: 0)
+                Text("\(curIdx + 1) / \(raw.count)")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundColor(UI.dim)
+            }
+        }
+        .padding(10)
+        .background(UI.card)
+        .cornerRadius(11)
+    }
+
+    private var footNote: some View {
+        Text("轨迹由本机记录：App 没开的那段录不到。原版是从车机上报的历史里按天拉回来的。")
+            .font(.system(size: 10))
+            .foregroundColor(UI.dim)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var emptyView: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "point.topleft.down.curvedto.point.bottomright.up")
+                .font(.system(size: 34))
+                .foregroundColor(UI.dim)
+            Text("还没有轨迹")
+                .font(.system(size: 14))
+                .foregroundColor(UI.text)
+            Text("开出去转一圈，App 每次刷到车的位置就会记一个点。")
+                .font(.system(size: 12))
+                .foregroundColor(UI.dim)
+                .multilineTextAlignment(.center)
+        }
+        .padding(30)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    // MARK: 数据
+
+    private var cur: TrackStore.Day? {
+        if sel < 0 || sel >= days.count { return nil }
+        return days[sel]
+    }
+
+    private var kmText: String {
+        return String(format: "%.2fKM", cur?.km ?? 0)
+    }
+
+    private var durText: String {
+        guard let d = cur else { return "0分0秒" }
+        let sec = max(0, (d.endAt - d.startAt) / 1000)
+        return String(sec / 60) + "分" + String(sec % 60) + "秒"
+    }
+
+    private var avgText: String {
+        return String(format: "%.1fKM/H", cur?.avgKph ?? 0)
+    }
+
+    private var maxText: String {
+        return String(format: "%.0fKM/H", cur?.maxKph ?? 0)
+    }
+
+    private var curIdx: Int {
+        if raw.isEmpty { return 0 }
+        return min(max(0, Int(idx)), raw.count - 1)
+    }
+
+    private var curPt: TrackStore.Pt? {
+        if raw.isEmpty { return nil }
+        return raw[curIdx]
+    }
+
+    private var curCoord: CLLocationCoordinate2D? {
+        if pts.isEmpty { return nil }
+        return pts[min(max(0, Int(idx)), pts.count - 1)]
+    }
+
+    private var kphText: String {
+        return String(format: "%.0f km/h", curPt?.kph ?? 0)
+    }
+
+    private func placeKey(_ tag: Int) -> String {
+        guard let d = cur else { return "none-" + String(tag) }
+        return d.key + "-" + String(tag)
+    }
+
+    private func load() {
+        days = TrackStore.shared.days()
+        sel = 0
+        if !days.isEmpty { loadDay() }
+    }
+
+    /// 换一天：读点、画线、清回放位置、重新解析起止地点。
+    private func loadDay() {
+        stopTimer()
+        playing = false
+        idx = 0
+        guard let d = cur else {
+            raw = []
+            pts = []
+            return
+        }
+        raw = TrackStore.shared.points(day: d.key)
+        var out: [CLLocationCoordinate2D] = []
+        out.reserveCapacity(raw.count)
+        for p in raw {
+            out.append(MapGeo.display(lat: p.lat, lng: p.lng))
+        }
+        pts = out
+        if let a = raw.first { askPlace(d.key, 0, a.lat, a.lng) }
+        if let b = raw.last { askPlace(d.key, 1, b.lat, b.lng) }
+        e.log("▶ 历史轨迹 " + d.key + " 共 " + String(raw.count) + " 点")
+    }
+
+    /// 逆地理。原版这两行是「省市区街道 + 门牌 + [POI 名 距离]」，
+    /// 距离那一截得靠服务端的 POI 库，这里用系统的 CLGeocoder 拿到能拿的部分。
+    private func askPlace(_ dayKey: String, _ tag: Int, _ lat: Double, _ lng: Double) {
+        let key = dayKey + "-" + String(tag)
+        if places[key] != nil { return }
+        if lat == 0 || lng == 0 { return }
+        let loc = CLLocation(latitude: lat, longitude: lng)
+        CLGeocoder().reverseGeocodeLocation(loc) { marks, _ in
+            guard let m = marks?.first else { return }
+            var s = ""
+            let parts: [String?] = [m.administrativeArea, m.locality,
+                                    m.subLocality, m.thoroughfare, m.subThoroughfare]
+            for p in parts {
+                if let x = p, !x.isEmpty { s += x }
+            }
+            if let n = m.name, !n.isEmpty, s.range(of: n) == nil {
+                s += "[" + n + "]"
+            }
+            if s.isEmpty { return }
+            DispatchQueue.main.async {
+                self.places[key] = s
+            }
+        }
+    }
+
+    // MARK: 回放
+
+    private func togglePlay() {
+        if playing {
+            stopTimer()
+            return
+        }
+        guard raw.count >= 2 else { return }
+        if Int(idx) >= raw.count - 1 { idx = 0 }
+        playing = true
+        timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { _ in
+            DispatchQueue.main.async {
+                if Int(self.idx) >= self.raw.count - 1 {
+                    self.stopTimer()
+                    return
+                }
+                self.idx = self.idx + 1
+            }
+        }
+    }
+
+    private func stopTimer() {
+        playing = false
+        if let t = timer {
+            t.invalidate()
+            timer = nil
+        }
+    }
+}
+
+// MARK: - 4. GPS 功能设置页
+
+/// 原版这一页就三行开关加两个按钮。三个开关对应的车机字段在安卓包里能查到
+/// （config.devcfg.privacy、parseVstStatus 里的 gps_opn / gps_cls），但写入走哪条
+/// 指令码没找到实证 —— iOS 包的主二进制是加密的，读不出来。所以这一版：
+///   · 开关的状态记在本机，下次进来还在；
+///   · 「查询」真去问一次车机（203100），把结果回显；
+///   · 「保存」如实告诉用户：这一版还没接车机的写入通道。
+/// 宁可少发，也不能瞎发一条配置指令把车机参数改坏。
+struct GpsSetPage: View {
+
+    @EnvironmentObject var e: AutoEngine
+
+    var onBack: () -> Void
+
+    @State private var gpsOn = Store.shared.flag("dev_gps_on", true)
+    @State private var fenceOn = Store.shared.flag("dev_fence_on", true)
+    @State private var privacy = Store.shared.flag("dev_privacy", false)
+    @State private var hint = ""
+    @State private var busy = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            PageTopBar(title: "GPS功能设置", onBack: onBack)
+
+            VStack(spacing: 1) {
+                switchRow("GPS开关", $gpsOn)
+                switchRow("电子围栏", $fenceOn)
+                switchRow("隐私模式", $privacy)
+            }
+            .background(UI.line)
+            .padding(.top, 10)
+
+            HStack(spacing: 56) {
+                blueBtn("查询") { query() }
+                blueBtn("保存") { save() }
+            }
+            .padding(.top, 28)
+
+            if !hint.isEmpty {
+                Text(hint)
+                    .font(.system(size: 12))
+                    .foregroundColor(UI.dim)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 24)
+                    .padding(.top, 16)
+            }
+
+            Spacer(minLength: 0)
+        }
+        .background(UI.bg)
+    }
+
+    private func switchRow(_ label: String, _ bind: Binding<Bool>) -> some View {
+        HStack(spacing: 10) {
+            Text(label)
+                .font(.system(size: 15))
+                .foregroundColor(UI.text)
+            Spacer(minLength: 0)
+            Toggle("", isOn: bind)
+                .labelsHidden()
+                .toggleStyle(SwitchToggleStyle(tint: UI.accent))
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 11)
+        .background(UI.card)
+    }
+
+    private func blueBtn(_ title: String, _ act: @escaping () -> Void) -> some View {
+        Button {
+            act()
+        } label: {
+            Text(title)
+                .font(.system(size: 16))
+                .foregroundColor(.white)
+                .frame(width: 108, height: 42)
+                .background(busy ? UI.dim : UI.accent)
+                .cornerRadius(6)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(PlainButtonStyle())
+    }
+
+    private func query() {
+        if busy { return }
+        busy = true
+        hint = "正在问车机…"
+        e.refreshStatus { c in
+            self.busy = false
+            guard let c = c else {
+                self.hint = "没查到。车机可能没在线，稍后再试。"
+                return
+            }
+            var s = "已查到：最后定位 " + mpStamp(c.reportedAt)
+            if !c.volt.isEmpty { s += " · 电压 " + c.volt + "V" }
+            if !c.temp.isEmpty { s += " · " + c.temp + "°" }
+            self.hint = s
+            self.e.log("▶ GPS功能设置：查询成功")
+        }
+    }
+
+    private func save() {
+        Store.shared.putFlag("dev_gps_on", gpsOn)
+        Store.shared.putFlag("dev_fence_on", fenceOn)
+        Store.shared.putFlag("dev_privacy", privacy)
+        hint = "开关已记在手机上。这三项属于车机固件设置，写入指令还没接通 —— "
+            + "原版走的是车机协议，码在加密的 iOS 包里读不出来，硬发可能把车机参数改坏。"
+        e.log("▶ GPS功能设置：保存 GPS=" + String(gpsOn)
+              + " 围栏=" + String(fenceOn) + " 隐私=" + String(privacy))
     }
 }
 
