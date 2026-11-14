@@ -3949,7 +3949,7 @@ final class AutoEngine: NSObject, ObservableObject {
     /// 参与了编译，界面上才会跟着变。
     ///
     /// 每次改源码就换一个值，装完瞄一眼底部就知道装的是哪一次构建。
-    static let buildTag = "b1110b"
+    static let buildTag = "b1110c"
 
     let ble = BleCentral()
     let api = CarAPI()
@@ -5828,7 +5828,8 @@ final class AutoEngine: NSObject, ObservableObject {
                         autoLockFails = 0
                         autoLockRetryAt = 0
                         if store.notifyEnabled {
-                            Notify.shared.lockUnconfirmed(distText: notifyDistText())
+                            // 返回值是「是否真的发出去」，这里不用，加 _ = 消掉编译警告
+                            _ = Notify.shared.lockUnconfirmed(distText: notifyDistText())
                         }
                         whyText = "⚠ 锁车没能确认，请手动核对车锁"
                     } else {
@@ -8004,7 +8005,8 @@ final class CarPinView: MKAnnotationView {
     }
 
     required init?(coder aDecoder: NSCoder) {
-        super.init(coder: a)
+        // 形参名是 aDecoder，不能写 a —— 写成 a 编译器会报 "cannot find 'a' in scope"
+        super.init(coder: aDecoder)
         isEnabled = false
         backgroundColor = .clear
         centerOffset = CGPoint(x: 0, y: 14)
