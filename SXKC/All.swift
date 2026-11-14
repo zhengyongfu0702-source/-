@@ -3509,7 +3509,11 @@ final class NetConn {
 
     private func closeLocked() {
         if fd >= 0 {
-            _ = close(fd)
+            // 1.49：必须写全 `Darwin.close`。这个类自己有 `func close()`，
+            // 直接写 `close(fd)` 会被解析成那个无参实例方法，编译报
+            // “use of 'close' refers to instance method rather than global function”。
+            // 1.48 就是这一行让整包编不过。
+            _ = Darwin.close(fd)
             fd = -1
         }
     }
@@ -4505,7 +4509,7 @@ final class AutoEngine: NSObject, ObservableObject {
     /// 参与了编译，界面上才会跟着变。
     ///
     /// 每次改源码就换一个值，装完瞄一眼底部就知道装的是哪一次构建。
-    static let buildTag = "b1110o"
+    static let buildTag = "b1110p"
 
     let ble = BleCentral()
     let api = CarAPI()
