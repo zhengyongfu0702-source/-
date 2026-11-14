@@ -54,8 +54,8 @@ targets:
       properties:
         CFBundleDisplayName: 五菱控车
         CFBundleName: SXKC
-        CFBundleShortVersionString: "1.39"
-        CFBundleVersion: "39"
+        CFBundleShortVersionString: "1.41"
+        CFBundleVersion: "41"
         CFBundleDevelopmentRegion: zh_CN
         LSRequiresIPhoneOS: true
         UILaunchScreen: {}
@@ -85,8 +85,8 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: cn.sxkc.lite
         PRODUCT_NAME: SXKC
         TARGETED_DEVICE_FAMILY: "1"
-        MARKETING_VERSION: "1.39"
-        CURRENT_PROJECT_VERSION: "39"
+        MARKETING_VERSION: "1.41"
+        CURRENT_PROJECT_VERSION: "41"
         GENERATE_INFOPLIST_FILE: NO
         SWIFT_OPTIMIZATION_LEVEL: "-O"
         ASSETCATALOG_COMPILER_APPICON_NAME: "AppIcon"
@@ -107,8 +107,8 @@ targets:
       path: SXKC/SXKCWidgetInfo.plist
       properties:
         CFBundleDisplayName: 五菱控车小组件
-        CFBundleShortVersionString: "1.39"
-        CFBundleVersion: "39"
+        CFBundleShortVersionString: "1.41"
+        CFBundleVersion: "41"
         NSExtension:
           NSExtensionPointIdentifier: com.apple.widgetkit-extension
     settings:
