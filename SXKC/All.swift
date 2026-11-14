@@ -1767,6 +1767,9 @@ enum StoreKey {
     /// 1.36：坐标校正（WGS-84 → GCJ-02）。默认开。
     /// 车机给的是 GPS 原始坐标，地图要的是火星坐标，不转就差几百米。
     static let coordFix = "coord_fix"
+    /// 1.46：状态长连接。复用一条 TCP + 一次登录，每 15 秒读一次状态。
+    /// 实测单次往返 0.03 秒（新建连接要 0.2~0.4 秒且每次都要重登），默认开。
+    static let liveLink = "live_link"
 }
 
 /// 1.33：内置的高德 Web 服务 key。用户不需要填，开箱就能显示地名。
@@ -1981,6 +1984,12 @@ final class Store {
     ///
     /// 只在**前台**跑：iOS 进后台后 Timer 必被挂起，写「后台也刷新」是骗人的。
     /// 蓝牙连着时状态帧 3 秒一帧，本身就在刷新，这条会跳过、不额外发网络请求。
+    /// 1.46 状态长连接开关
+    var liveLink: Bool {
+        get { return flag(StoreKey.liveLink, true) }
+        set { putFlag(StoreKey.liveLink, newValue) }
+    }
+
     var autoRefresh: Bool {
         get { return flag(StoreKey.autoRefresh, true) }
         set { putFlag(StoreKey.autoRefresh, newValue) }
@@ -2200,6 +2209,22 @@ final class Notify: NSObject {
         // 不设 sound：锁车是"应该发生的事"，出声反而吵
         c.sound = nil
         post(id: "sxkc.auto.locked", content: c)
+        return true
+    }
+
+    /// 电子围栏越界（1.43）。
+    ///
+    /// 原版是**车机自己判**、越界后服务端推 `ActionMapWarn`，所以 App 没开也报警。
+    /// 我们没有长连接，只能退一步：App 在前台时每 60 秒拿车的上报位置判一次。
+    /// 这条通知就是那一轮的产物 —— 人退到后台就停，日志里会写清楚。
+    @discardableResult
+    func fenceAlert(title: String, body: String) -> Bool {
+        let c = UNMutableNotificationContent()
+        c.title = title
+        c.body = body
+        c.sound = .default
+        // 每条用独立 id：围栏可能连着触发多次，不能被上一条覆盖掉
+        post(id: "sxkc.fence." + UUID().uuidString, content: c)
         return true
     }
 
@@ -2486,6 +2511,10 @@ final class CarAPI {
 
     static let HOST = "www.zxy268.com"
     static let PORT: UInt16 = 3050
+    /// 状态推送端口。原版 `Server._portst = 3010`，`_portst2 = _portst + 1 = 3011`，
+    /// 而 `SendTcpStatus.send()` 用的是 `getPortStatus2()` —— 也就是 **3011**。
+    /// 实测 3010 连上即被服务端断开，3011 才能订阅成功。
+    static let PORT_PUSH: UInt16 = 3011
     static let DISTRIBUTE = "sxkc"
     static let CHNL = "android"
     static let VER = "1.0"
@@ -2669,13 +2698,14 @@ final class CarAPI {
         var json: [String: Any]?
     }
 
-    func send(_ code: String, bodyJson: String = "{}") throws -> Resp {
+    func send(_ code: String, bodyJson: String = "{}", ioTimeoutSec: Int = 40) throws -> Resp {
         let req = JB.o([
             ("sys_head", .raw(sysHead(code))),
             ("app_head", .raw(appHead(ssk, tid))),
             ("body", .raw(bodyJson))
         ])
-        let text = try NetClient.call(req, host: CarAPI.HOST, port: CarAPI.PORT)
+        let text = try NetClient.call(req, host: CarAPI.HOST, port: CarAPI.PORT,
+                                      ioTimeoutSec: ioTimeoutSec)
         var r = Resp()
         r.raw = text
         guard let data = text.data(using: .utf8),
@@ -2695,13 +2725,36 @@ final class CarAPI {
 
     func lock() throws -> Resp { return try send(CarAPI.CODE_LOCK) }
     func unlock() throws -> Resp { return try send(CarAPI.CODE_UNLOCK) }
-    /// 叫车机立刻现报一次（= 303598，原版实时追踪每 60 秒发的那条）。
-    /// 原版这条不带 body，设备号走 app_head.tid，所以这里也不塞参数。
-    func reportNow() throws -> Resp { return try send(CarAPI.CODE_REPORT_NOW) }
+    /// 303598：原版实时追踪每 60 秒顺手发的那条（`TrackFlowController$MyOnDelay.onTimer`）。
+    ///
+    /// **1.47 起 App 里不再调用它**，留着是为了以后抓包对照。原因：
+    /// 1.45 在车上连测三轮，车机上报节奏（通电 46 秒 / 停车 183 秒）一次都没被
+    /// 这条指令提前，`rdt`（车机应答时间）也没动过 —— 它不会让车机额外报一次。
+    /// 真正让位置实时的是 3011 端口的状态订阅（见 `PushLink`）。
+    ///
+    /// 另外注意：`30*` 是控制类，服务端会挂起等车机回执，车机休眠时 65 秒都不回，
+    /// 所以以前拿它当「刷新」用，等于每次白挂一条连接。
+    func reportNow() throws -> Resp {
+        return try send(CarAPI.CODE_REPORT_NOW, ioTimeoutSec: 65)
+    }
     /// 一键启动（远程着车）。走网络，不需要蓝牙在附近。
-    func startEngine() throws -> Resp { return try send(CarAPI.CODE_START) }
-    /// 熄火
-    func stopEngine() throws -> Resp { return try send(CarAPI.CODE_STOP) }
+    ///
+    /// 1.46 实测订正（23:20 在你这台 G8001 上验证过）：
+    /// 以前这里发的是**空 body**，服务端照样回 `status=S / 操作成功`，
+    /// 但车机那边一点动静都没有（`rdt` 不动、`vst` 不变、电压还是 14.0V）。
+    /// 换成 `{"tid":…,"starttime":"0"}` 之后：熄火 10 秒内 `vst` 从 `38A0` 变 `20A0`、
+    /// 电压 140→131；启动 12 秒内回到 `38A0` / 140。所以 `starttime` 不是可选项，
+    /// 少了它服务端只「受理」不下发 —— 这正是「一键启动/熄火点了没反应」的根因。
+    func startEngine() throws -> Resp { return try engineCmd(CarAPI.CODE_START) }
+    /// 熄火（同样必须带 starttime）
+    func stopEngine() throws -> Resp { return try engineCmd(CarAPI.CODE_STOP) }
+
+    /// 启动 / 熄火共用：body 必须带 tid + starttime。
+    /// 启动的回包会多一个 `rspcode:203105`，那只是「结果去 203105 查」的提示，
+    /// 真正成没成只能看 `vst` 的 ACC/发动机位，别拿 status=S 当成功。
+    private func engineCmd(_ code: String) throws -> Resp {
+        return try send(code, bodyJson: JB.o([("tid", .s(tid)), ("starttime", .s("0"))]))
+    }
 
     // MARK: 状态
 
@@ -2709,30 +2762,85 @@ final class CarAPI {
     func status() -> Car? {
         do {
             let r = try send(CarAPI.CODE_STATUS, bodyJson: JB.o([("tid", .s(tid))]))
-            var c: Car?
-            if let b = r.json?["body"] as? [String: Any] {
-                let src = (b["lloc"] as? [String: Any]) ?? b
-                if let vst = src["vst"] as? String, !vst.isEmpty {
-                    c = CarAPI.parseCar(src, CarAPI.nowMs())
-                }
-            }
-            if c == nil && r.raw.contains("\"vst\"") {
-                c = CarAPI.parseLoose(r.raw)
-            }
-            return c
+            return CarAPI.parseStatusText(r.raw, r.json)
         } catch {
             return nil
         }
     }
 
+    /// 常驻连接（1.46）用的完整报文：一次查询的全部字节，交给 `NetConn.send` 直接发。
+    /// 单独抽出来是为了让「轮询」不必每次重新登录 —— 省下的是两次往返。
+    func statusRequestJson() -> String {
+        return JB.o([
+            ("sys_head", .raw(sysHead(CarAPI.CODE_STATUS))),
+            ("app_head", .raw(appHead(ssk, tid))),
+            ("body", .raw(JB.o([("tid", .s(tid))])))
+        ])
+    }
+
+    /// 推送订阅报文（1.47）。原版 `SendTcpStatus.send()` → `CmdBuilder.getTcp()`：
+    /// 和 3050 的报文结构一样，但有两点不同 ——
+    /// ① `app_head.ssk` 和 `app_head.uid` 被显式置成空串（`getTcp` 里 set("")）；
+    /// ② 多一个 `app_head.timezone`。
+    /// 服务端认的就是这条「我是查询，别回一次就关，有变化就推给我」。
+    func statusSubscribeJson() -> String {
+        return JB.o([
+            ("sys_head", .raw(sysHead(CarAPI.CODE_STATUS))),
+            ("app_head", .raw(JB.o([
+                ("lang", .s("cn")),
+                ("ssk", .s("")),
+                ("tid", .s(tid)),
+                ("uid", .s("")),
+                ("timezone", .s("8"))
+            ]))),
+            ("body", .raw(JB.o([("tid", .s(tid))])))
+        ])
+    }
+
+    /// 把 203100 的回包文本解析成 Car。抽成 static 是因为常驻连接那条路
+    /// 拿到的就是裸文本，没有再包一层 Resp。
+    static func parseStatusText(_ raw: String, _ json: [String: Any]? = nil) -> Car? {
+        var root = json
+        if root == nil, let data = raw.data(using: .utf8) {
+            root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        }
+        var c: Car?
+        if let b = root?["body"] as? [String: Any] {
+            // 车机联网时有些版本会把状态塞在 body.lloc 里
+            let src = (b["lloc"] as? [String: Any]) ?? b
+            if let vst = src["vst"] as? String, !vst.isEmpty {
+                c = parseCar(src, nowMs())
+            }
+        }
+        if c == nil && raw.contains("\"vst\"") {
+            c = parseLoose(raw)
+        }
+        return c
+    }
+
     // MARK: 历史轨迹（只读）
+
+    /// 服务端回来的一个轨迹点。
+    ///
+    /// 1.42 实测（账号 15980005334，车机 30071067124 五菱 K-car）：
+    /// `901011` 的 `body.rows` 每行是
+    ///     {"u": 1794585600, "t": 24.82118, "g": 118.5854, "s": 15, "d": 100, "v": "140"}
+    ///   u = unix **秒**（不是毫秒）、t = 纬度、g = 经度、s = 速度 KM/H、
+    ///   d = 方向角、v = 电压（"140" = 14.0V）。
+    /// 所以时间戳和速度都有，时长/均速/最高速可以真算，不用再显示「--」。
+    struct HistoryPoint {
+        var lat: Double
+        var lng: Double
+        var ts: Int64      // 毫秒；服务端给秒，这里乘过 1000
+        var kph: Double
+    }
 
     /// 取某一天的轨迹点。`dayStartSec` 是那天 0 点的 unix 秒。
     ///
     /// 只读查询：服务端不会因为这条指令去叫车机，也不会改任何配置。
     /// 响应里每个点的键是 `t`（纬度）/ `g`（经度），个别版本用 lat/lng，
-    /// 两个都认。点没有时间戳，所以调用方拿到的只是几何。
-    func historyPath(dayStartSec: Int64) throws -> [(Double, Double)] {
+    /// 两个都认。
+    func historyPath(dayStartSec: Int64) throws -> [HistoryPoint] {
         let bg = String(dayStartSec)
         let ed = String(dayStartSec + 86400)
         let body = JB.o([
@@ -2764,7 +2872,7 @@ final class CarAPI {
             }
         }
 
-        var out: [(Double, Double)] = []
+        var out: [HistoryPoint] = []
         out.reserveCapacity(rows.count)
         for row in rows {
             // t/g 是原版用的键；lat/lng 是兜底，防止服务端换了字段名
@@ -2774,7 +2882,22 @@ final class CarAPI {
             // 0,0 是没定位，画上去会是一条从非洲拉过来的线
             if a == 0 || o == 0 { continue }
             if abs(a) > 90 || abs(o) > 180 { continue }
-            out.append((a, o))
+
+            // u 是秒。兜底顺序：u → ts → time，都没有就记 0（老服务端）。
+            let rawT = CarAPI.num(row["u"]) ?? CarAPI.num(row["ts"]) ?? CarAPI.num(row["time"]) ?? 0
+            var ms: Int64 = 0
+            if rawT > 0 {
+                ms = rawT > 100_000_000_000 ? Int64(rawT) : Int64(rawT * 1000)
+            }
+            // s 是速度 KM/H
+            let kph = CarAPI.num(row["s"]) ?? CarAPI.num(row["speed"]) ?? 0
+            out.append(HistoryPoint(lat: a, lng: o, ts: ms, kph: max(0, kph)))
+        }
+
+        // 服务端按时间正序给，但有的版本倒序 —— 统一按时间排，
+        // 没时间戳的就保持原顺序（不能全挤到 1970）。
+        if out.contains(where: { $0.ts > 0 }) {
+            out.sort { $0.ts < $1.ts }
         }
         return out
     }
@@ -2799,6 +2922,7 @@ final class CarAPI {
         c.power = (o["power"] as? String) ?? ""
         c.mileage = (o["mileage"] as? String) ?? ""
         c.tdt = parseLong((o["tdt"] as? String) ?? "", 0)
+        c.sdt = parseLong((o["sdt"] as? String) ?? "", 0)
         finish(&c, fetchedAt)
         return c
     }
@@ -2815,6 +2939,7 @@ final class CarAPI {
         c.power = lastOf(raw, "power")
         c.mileage = lastOf(raw, "mileage")
         c.tdt = parseLong(lastOf(raw, "tdt"), 0)
+        c.sdt = parseLong(lastOf(raw, "sdt"), 0)
         finish(&c, nowMs())
         return c
     }
@@ -2887,6 +3012,12 @@ final class CarAPI {
         var power = ""
         var mileage = ""
         var tdt: Int64 = 0
+        /// 1.44：`sdt` = 服务端**最后一次收到车机数据**的时间（秒）。
+        ///
+        /// 和 `tdt`（定位时间）不是一回事：车停着不动时 tdt 几个小时都不变，
+        /// 但车机每隔几分钟照常发一次心跳，sdt 会一直往前推。
+        /// 判断「车机到底还在不在线」必须看 sdt，只看 tdt 会把在线的车判成失联。
+        var sdt: Int64 = 0
         var speedKph = 0
         var reportedAt: Int64 = 0
         var moving = false
@@ -2963,7 +3094,7 @@ enum NetClient {
 
     // MARK: - socket
 
-    private static func openSocket(host: String, port: UInt16, timeoutMs: Int32) throws -> Int32 {
+    fileprivate static func openSocket(host: String, port: UInt16, timeoutMs: Int32) throws -> Int32 {
         var hints = addrinfo()
         hints.ai_family = AF_UNSPEC
         hints.ai_socktype = SOCK_STREAM
@@ -3028,18 +3159,18 @@ enum NetClient {
         throw NetError.connect(last)
     }
 
-    private static func closeSocket(_ fd: Int32) {
+    fileprivate static func closeSocket(_ fd: Int32) {
         if fd >= 0 { _ = close(fd) }
     }
 
-    private static func setTimeouts(_ fd: Int32, seconds: Int) {
+    fileprivate static func setTimeouts(_ fd: Int32, seconds: Int) {
         var tv = timeval(tv_sec: seconds, tv_usec: 0)
         let sz = socklen_t(MemoryLayout<timeval>.size)
         _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sz)
         _ = setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sz)
     }
 
-    private static func writeAll(_ fd: Int32, _ bytes: [UInt8]) throws {
+    fileprivate static func writeAll(_ fd: Int32, _ bytes: [UInt8]) throws {
         var off = 0
         while off < bytes.count {
             let n: Int = bytes.withUnsafeBytes { p -> Int in
@@ -3054,7 +3185,7 @@ enum NetClient {
         }
     }
 
-    private static func readExactly(_ fd: Int32, _ count: Int) throws -> [UInt8] {
+    fileprivate static func readExactly(_ fd: Int32, _ count: Int) throws -> [UInt8] {
         var out = [UInt8](repeating: 0, count: count)
         var off = 0
         while off < count {
@@ -3065,11 +3196,346 @@ enum NetClient {
             if n == 0 { throw NetError.io("连接被对端关闭") }
             if n < 0 {
                 if errno == EINTR { continue }
+                // 服务端把控制指令转给车机后要等车机回执，车机休眠时一直不回，
+                // 这里就是读超时（EAGAIN）。给个能看懂的文案，别让界面出现 errno 35。
+                if errno == EAGAIN || errno == EWOULDBLOCK {
+                    throw NetError.io("等车机回执超时")
+                }
                 throw NetError.io("接收失败 errno \(errno)")
             }
             off += n
         }
         return out
+    }
+
+    /// 在**已经连上**的 fd 上走一个来回（发一条、收一条）。
+    /// 1.46 拆出来给 `NetConn` 复用：省掉每次新建连接的握手和登录。
+    fileprivate static func roundTrip(_ fd: Int32, json: String, ioTimeoutSec: Int) throws -> String {
+        let sig = Crypto.hmacSha1Upper("", json)
+        let payload = Array((json + sig).utf8)
+        let header = Array(String(format: "%08ld", payload.count).utf8)
+
+        setTimeouts(fd, seconds: ioTimeoutSec)
+        try writeAll(fd, header + payload)
+
+        let hb = try readExactly(fd, 8)
+        let hStr = String(bytes: hb, encoding: .ascii)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard let len = Int(hStr), len > 0, len <= 4 * 1024 * 1024 else {
+            throw NetError.badHeader
+        }
+        let body = try readExactly(fd, len)
+        guard let text = String(bytes: body, encoding: .utf8) else {
+            throw NetError.io("响应不是 UTF-8")
+        }
+        return text
+    }
+}
+
+// MARK: - 状态推送长连接（1.47）
+
+/// 原版 `ConnTcpStatus` 的复刻 —— 这才是「车一动手机立刻知道」的真通道。
+///
+/// 1.46 的判断（"这套协议没有推送"）是错的，原因是我拿 3050 的报文格式去连 3011，
+/// 服务端当然不理。原版 `SendTcpStatus.send()` 走的是 `getPortStatus2()` = **3011**，
+/// 而且报文头完全不同：
+///
+///     发送：'$'(0x24) | hlen(1B = 2 或 3) | 长度(2*hlen 个 ASCII 十六进制) | uid(8B) | 0x02 | JSON+HMAC
+///     接收：'$' | hlen | 2*hlen 个 ASCII 十六进制长度 | 正文
+///           单字节 '^' 是心跳
+///
+/// 实测（2026-11-14 23:5x，账号 15980005334 / 车机 30071067124）：
+/// 发一条 203100 订阅后，4.5 秒、6.4 秒各推一条完整状态，之后每 **8 秒** 一个 `^`，
+/// 车机每次上报都会把新状态推过来。3010 端口反而直接断开（不是这个用途）。
+final class PushLink {
+
+    private let host: String
+    private let port: UInt16
+
+    private var fd: Int32 = -1
+    private var stopFlag = false
+    private let lock = NSLock()
+    private var thread: Thread?
+    private var frame: [UInt8] = []
+
+    /// 回调都在后台线程触发，调用方自己切主线程
+    var onText: ((String) -> Void)?
+    var onBeat: (() -> Void)?
+    var onState: ((Bool, String) -> Void)?
+
+    private(set) var lastRecvAt = Date(timeIntervalSince1970: 0)
+    private(set) var reconnects = 0
+
+    init(host: String = CarAPI.HOST, port: UInt16 = CarAPI.PORT_PUSH) {
+        self.host = host
+        self.port = port
+    }
+
+    var alive: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return fd >= 0
+    }
+
+    /// 组一帧订阅报文。uid 必须是登录拿到的数字 uid（原版 `UtilsField.uid()`）。
+    static func makeFrame(json: String, uid: String) -> [UInt8] {
+        let sig = Crypto.hmacSha1Upper("", json)
+        let body = Array((json + sig).utf8)
+        let u = UInt64(uid) ?? 0
+        // %04X / %06X 配 UInt32，%016llX 配 UInt64 —— 直接传 Int 在 arm64 上
+        // 会踩可变参数的槽位宽度，编码出来的帧头会错位。
+        let head = body.count < 65535
+            ? String(format: "2402%04X%016llX02", UInt32(body.count), u)
+            : String(format: "2403%06X%016llX02", UInt32(body.count), u)
+        var out = hexToBytes(head)
+        out.append(contentsOf: body)
+        return out
+    }
+
+    private static func hexToBytes(_ s: String) -> [UInt8] {
+        var out = [UInt8]()
+        var hi: UInt8?
+        for ch in s.utf8 {
+            let v: UInt8
+            switch ch {
+            case 48...57: v = ch - 48
+            case 65...70: v = ch - 55
+            case 97...102: v = ch - 87
+            default: continue
+            }
+            if let h = hi { out.append((h << 4) | v); hi = nil } else { hi = v }
+        }
+        return out
+    }
+
+    func start(json: String, uid: String) {
+        stop()
+        lock.lock()
+        stopFlag = false
+        frame = PushLink.makeFrame(json: json, uid: uid)
+        lock.unlock()
+
+        let t = Thread { [weak self] in self?.loop() }
+        t.name = "sxkc-push-link"
+        t.stackSize = 512 * 1024
+        lock.lock(); thread = t; lock.unlock()
+        t.start()
+    }
+
+    /// 只打断、不关闭：`shutdown` 能让阻塞中的 `recv` 立刻返回，
+    /// 而 fd 由 loop 线程自己收尾，避免两边同时 close 同一个 fd。
+    func stop() {
+        lock.lock()
+        stopFlag = true
+        let f = fd
+        lock.unlock()
+        if f >= 0 { shutdown(f, Int32(SHUT_RDWR)) }
+    }
+
+    private func stopped() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return stopFlag
+    }
+
+    private func loop() {
+        var mode = 0            // 0 找包头 / 1 读 hlen / 2 读长度字段 / 3 读正文
+        var headBuf: [UInt8] = []
+        var needHead = 0
+        var left = 0
+        var body: [UInt8] = []
+
+        while !stopped() {
+            // 1) 没连接就先连 + 发订阅
+            lock.lock()
+            let needConnect = (fd < 0)
+            let f0 = frame
+            lock.unlock()
+
+            if needConnect {
+                var nfd: Int32 = -1
+                do {
+                    nfd = try NetClient.openSocket(host: host, port: port, timeoutMs: 10000)
+                    NetClient.setTimeouts(nfd, seconds: 10)
+                    try NetClient.writeAll(nfd, f0)
+                    lock.lock()
+                    if stopFlag {
+                        lock.unlock()
+                        _ = close(nfd)
+                        return
+                    }
+                    fd = nfd
+                    lock.unlock()
+                    lastRecvAt = Date()
+                    onState?(true, "已订阅")
+                } catch {
+                    if nfd >= 0 { _ = close(nfd) }
+                    lock.lock(); reconnects += 1; lock.unlock()
+                    onState?(false, error.localizedDescription)
+                    Thread.sleep(forTimeInterval: 1.0)
+                    continue
+                }
+            }
+
+            // 2) 读一包（SO_RCVTIMEO 10 秒，超时只是空闲，不算断线）
+            var buf = [UInt8](repeating: 0, count: 1024)
+            let n = buf.withUnsafeMutableBytes { p -> Int in
+                guard let base = p.baseAddress else { return -1 }
+                return recv(fd, base, 1024, 0)
+            }
+
+            if n > 0 {
+                lastRecvAt = Date()
+                let chunk = Array(buf[0..<n])
+                var i = 0
+                while i < chunk.count {
+                    let b = chunk[i]
+                    switch mode {
+                    case 0:
+                        if b == 0x24 {                 // '$'
+                            mode = 1
+                        } else if b == 0x5E {           // '^' 心跳
+                            onBeat?()
+                        }
+                        i += 1
+                    case 1:
+                        let hlen = Int(b)
+                        if hlen > 0 && hlen < 3 {
+                            needHead = hlen
+                            headBuf = []
+                            mode = 2
+                        } else {
+                            mode = 0
+                        }
+                        i += 1
+                    case 2:
+                        headBuf.append(b)
+                        i += 1
+                        if headBuf.count >= needHead {
+                            let s = String(bytes: headBuf, encoding: .ascii) ?? ""
+                            left = Int(s, radix: 16) ?? 0
+                            body = []
+                            mode = left > 0 ? 3 : 0
+                        }
+                    case 3:
+                        body.append(b)
+                        i += 1
+                        if body.count >= left {
+                            if let text = String(bytes: body, encoding: .utf8) {
+                                onText?(text)
+                            }
+                            mode = 0
+                            body = []
+                        }
+                    default:
+                        mode = 0
+                        i += 1
+                    }
+                }
+                continue
+            }
+
+            // 3) 断线 / 半死连接
+            var dead = false
+            if n == 0 {
+                dead = true
+            } else {
+                if errno == EINTR { continue }
+                if errno == EAGAIN || errno == EWOULDBLOCK {
+                    // 10 秒没数据是正常的（心跳 8 秒一个），但超过 40 秒一个字节
+                    // 都没有就说明连接已经半死了，重连比干等强。
+                    if Date().timeIntervalSince(lastRecvAt) > 40 { dead = true }
+                    continue
+                }
+                dead = true
+            }
+            if dead {
+                lock.lock()
+                let f = fd
+                fd = -1
+                lock.unlock()
+                if f >= 0 { _ = close(f) }
+                mode = 0
+                onState?(false, "连接断开")
+                if stopped() { return }
+                Thread.sleep(forTimeInterval: 1.0)
+            }
+        }
+
+        lock.lock()
+        let f = fd
+        fd = -1
+        lock.unlock()
+        if f >= 0 { _ = close(f) }
+    }
+}
+
+// MARK: - 常驻连接（1.46）
+
+/// 一条不关的 TCP 连接，反复在它上面发查询。
+///
+/// 为什么值得单独写：以前每次查状态都是「新建 socket → 三次握手 → 发 → 收 → 关」，
+/// 一次往返 200~400ms 且每次都要重新登录。实测（23:24，账号 15980005334）
+/// 复用连接后单次查询 **0.03 秒**，一轮登录只做一次。
+///
+/// 它不是「服务端主动推送」—— 实测 3050 挂 165 秒、3010 挂 80 秒都收不到任何
+/// 主动报文，这套协议根本没有推送（原版 202110 走的是第三方推送 SDK，
+/// 登录报文里那两个 `pushid` / `pushchnl` 字段就是给它用的）。
+/// 所以这里做的是「常驻连接 + 高频轮询」，把延迟压到 0.03 秒/次，
+/// 剩下唯一的延迟就是车机自己的上报节奏（停车 183 秒、通电 46 秒）。
+final class NetConn {
+
+    private var fd: Int32 = -1
+    private let mutex = NSLock()
+    private let host: String
+    private let port: UInt16
+
+    /// 用来在界面上显示「常连接是否活着」
+    private(set) var lastOK = Date(timeIntervalSince1970: 0)
+    private(set) var lastError = ""
+
+    init(host: String = CarAPI.HOST, port: UInt16 = CarAPI.PORT) {
+        self.host = host
+        self.port = port
+    }
+
+    var connected: Bool {
+        mutex.lock(); defer { mutex.unlock() }
+        return fd >= 0
+    }
+
+    func close() {
+        mutex.lock(); defer { mutex.unlock() }
+        closeLocked()
+    }
+
+    private func closeLocked() {
+        if fd >= 0 {
+            _ = close(fd)
+            fd = -1
+        }
+    }
+
+    private func ensureLocked() throws {
+        if fd >= 0 { return }
+        fd = try NetClient.openSocket(host: host, port: port, timeoutMs: 10000)
+    }
+
+    /// 发一条、收一条。断线会自动重连**并重试一次** —— 常驻连接最常见的失败
+    /// 就是「空闲久了被 NAT 掐掉」，这时候重连重发几乎没有感知。
+    func send(_ json: String, ioTimeoutSec: Int = 12) throws -> String {
+        mutex.lock(); defer { mutex.unlock() }
+        do {
+            try ensureLocked()
+            let text = try NetClient.roundTrip(fd, json: json, ioTimeoutSec: ioTimeoutSec)
+            lastOK = Date()
+            return text
+        } catch {
+            closeLocked()
+            lastError = error.localizedDescription
+            try ensureLocked()
+            let text = try NetClient.roundTrip(fd, json: json, ioTimeoutSec: ioTimeoutSec)
+            lastOK = Date()
+            return text
+        }
     }
 }
 
@@ -4039,7 +4505,7 @@ final class AutoEngine: NSObject, ObservableObject {
     /// 参与了编译，界面上才会跟着变。
     ///
     /// 每次改源码就换一个值，装完瞄一眼底部就知道装的是哪一次构建。
-    static let buildTag = "b1110h"
+    static let buildTag = "b1110o"
 
     let ble = BleCentral()
     let api = CarAPI()
@@ -4058,6 +4524,22 @@ final class AutoEngine: NSObject, ObservableObject {
     @Published var signedIn = false
     @Published var devName = ""
     @Published var lastResult = ""
+    /// 1.48：远程启动/熄火进行中的标记，空串表示空闲，"start"/"stop" 表示正在等车机执行。
+    /// 单独开一个而不是复用 `acting`：`acting` 也管锁车/开锁，界面上要显示的是
+    /// 「按钮现在能不能点、点的是哪一条」，不能拿一个混着用的布尔值猜。
+    @Published var engineBusy = ""
+    /// 1.48：手动刷新进行中。用来把「刷新车辆状态」按钮变成「读取中…」并暂时禁用。
+    @Published var refreshing = false
+    /// 每次手动刷新递增一次。用来让「30 秒兜底解锁」只对它是哪一次生效，
+    /// 免得连着点两次时，第一次的兜底定时器把第二次的状态提前抹掉。
+    private var refreshSeq = 0
+    /// 1.44：点「刷新车辆状态」后的结论，直接写在卡片上。
+    ///
+    /// 以前这个结论只进日志（要进诊断页才看得到），卡片上什么都不说，
+    /// 用户只能盯着没变的数字猜「到底刷没刷」。现在这里写成一句话：
+    /// 「✓ 位置已更新到 23:12」「✓ 车机在线（2 分钟前有上报），位置没变」
+    /// 「✗ 车机没响应 · 最后上报 18:34（4 小时前）」。
+    @Published var refreshNote = ""
     /// 打码后的当前账号，界面上显示「你登的是谁」
     @Published var accountText = ""
 
@@ -4119,6 +4601,8 @@ final class AutoEngine: NSObject, ObservableObject {
     @Published var vehStateShown = false
     /// 自动刷新状态开关（1.30，界面绑定）。只在前台跑，进后台自动停。
     @Published var autoRefreshEnabled = true
+    /// 1.46：状态长连接开关（持久化到 Store，默认开）
+    @Published var liveLinkOn = true
 
     // 诊断页
     @Published var diagDevices: [DiagDevice] = []
@@ -4156,6 +4640,8 @@ final class AutoEngine: NSObject, ObservableObject {
     private var bleEng = false
     /// 自动刷新定时器。iOS 进后台必被挂起，所以它是「前台才有」的。
     private var autoRefreshTimer: Timer?
+    /// 1.43：围栏守卫。和地图页、实时追踪都无关，App 在前台就每 60 秒判一次。
+    private var fenceWatchTimer: Timer?
     /// 断连后那次「查状态 → 必要时锁车」的去重时刻。
     /// 链路抖动时断开/连上会来回好几次，不去重就会连发好几条查询。
     private var linkLostQueryAt: Int64 = 0
@@ -4302,6 +4788,11 @@ final class AutoEngine: NSObject, ObservableObject {
         locText = loc.statusText
         statsText = Stats.summary()
         Notify.shared.setup()
+        // 1.43：围栏守卫不依赖任何页面。init 里不能直接排定时器（run loop 可能还没转），
+        // 丢到主队列下一次循环再起。
+        DispatchQueue.main.async { [weak self] in
+            self?.startFenceWatch()
+        }
         log("iOS 版启动")
         log("提示：iOS 拿不到车机 MAC，改用 0xFFE0 指纹 + 已记住的 identifier 连接")
 
@@ -4452,6 +4943,10 @@ final class AutoEngine: NSObject, ObservableObject {
         // 由 decideAction 按需启停。启动时先连蓝牙，连上就一分钱定位电都不花。
         ble.ensureConnected()
         startAutoRefresh()
+        // 1.46：顺手把状态长连接挂上。它比 5 分钟一次的自动刷新快得多
+        // （15 秒一拍、单次 0.03 秒），但两者不冲突：长连接只管读数，
+        // 自动刷新负责那些「到点了该做判断」的周期性动作。
+        startLiveLink()
     }
 
     func stop() {
@@ -4481,6 +4976,7 @@ final class AutoEngine: NSObject, ObservableObject {
         stopUnlockWatch()
         loc.stop()
         stopAutoRefresh()
+        stopLiveLink()
         geoActive = false
         distText = ""
         log("■ 自动模式关闭")
@@ -5085,7 +5581,7 @@ final class AutoEngine: NSObject, ObservableObject {
         // 而不是「偷偷发一条」—— 那正是用户选纯蓝牙时要避开的东西。
         if store.chMode == Logic.MODE_BLE {
             log("· 仅蓝牙模式：\(start ? "一键启动" : "熄火")只能走网络，已禁用")
-            lastResult = "仅蓝牙模式不支持\(start ? "启动" : "熄火")"
+            noteEngineResult("仅蓝牙模式不支持\(start ? "启动" : "熄火")")
             return
         }
         guard !acting else {
@@ -5094,35 +5590,83 @@ final class AutoEngine: NSObject, ObservableObject {
         }
         log("▶ \(start ? "一键启动" : "熄火")")
         acting = true
+        engineBusy = start ? "start" : "stop"
         ensureSession { ok in
             guard ok else {
                 self.acting = false
+                self.engineBusy = ""
                 self.log("✗ 无有效会话，网络通道不可用")
-                self.lastResult = "未登录"
+                self.noteEngineResult("未登录")
                 return
             }
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
                     let r = start ? (try self.api.startEngine()) : (try self.api.stopEngine())
                     DispatchQueue.main.async {
-                        self.acting = false
-                        if r.ok {
-                            self.log("✓ \(start ? "启动" : "熄火")成功")
-                            self.lastResult = start ? "启动成功" : "熄火成功"
-                            self.refreshStatus()
-                        } else {
+                        guard r.ok else {
+                            self.acting = false
+                            self.engineBusy = ""
                             self.log("✗ \(start ? "启动" : "熄火")失败 \(r.code) \(r.msg)")
-                            self.lastResult = "\(r.code)"
+                            self.noteEngineResult("\(start ? "启动" : "熄火")失败 \(r.code)")
+                            return
                         }
+                        // 1.46：`status=S / 操作成功` 只是「服务端受理了」。
+                        // 以前到这一步就报「启动成功」，可车机压根没动 —— 空 body
+                        // 就是这样：回包漂亮、车不动。所以现在必须再看 vst。
+                        self.log("· 已受理（" + (r.code.isEmpty ? "S" : r.code) + "），等车机执行…")
+                        self.noteEngineResult(start ? "指令已下发，等车机启动…" : "指令已下发，等车机熄火…")
+                        self.confirmEngine(start: start, left: 11)
                     }
                 } catch {
                     DispatchQueue.main.async {
                         self.acting = false
+                        self.engineBusy = ""
                         self.log("✗ 网络异常 \(error.localizedDescription)")
-                        self.lastResult = "网络异常"
+                        self.noteEngineResult("网络异常")
                     }
                 }
             }
+        }
+    }
+
+    /// 启动 / 熄火下完之后盯 `vst`，看到 ACC/发动机位真的变了才算成功。
+    ///
+    /// 实测延迟：熄火 10 秒内、启动 12 秒内（车机通电时每 46 秒上报一次，
+    /// 指令是即时走通道的，不用等整轮上报）。所以每 3 秒读一次、最多 30 秒足够。
+    private func confirmEngine(start: Bool, left: Int) {
+        refreshStatus { c in
+            if let c = c {
+                let done = start ? c.eng : (!c.eng && !c.acc)
+                if done {
+                    self.acting = false
+                    self.engineBusy = ""
+                    self.log("✓ \(start ? "启动" : "熄火")成功（vst=" + c.vst + "）")
+                    self.noteEngineResult(start ? "✓ 启动成功 · 车已在怠速" : "✓ 熄火成功 · 车已熄火")
+                    return
+                }
+            }
+            guard left > 1 else {
+                self.acting = false
+                self.engineBusy = ""
+                self.log("✗ 指令受理了但车机没执行（30 秒内 vst 没变），"
+                         + "先确认车在 P 档、手刹、车门关闭")
+                self.noteEngineResult(start ? "✗ 30 秒内没启动起来，查一下 P 档、手刹、车门" : "✗ 30 秒内没熄火，查一下车是否已停稳")
+                return
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                self.confirmEngine(start: start, left: left - 1)
+            }
+        }
+    }
+
+    /// 写一条启动/熄火的结果，25 秒后自动清掉。
+    /// 以前 `lastResult` 只写不清 —— 半夜启动过一次，第二天早上打开 App
+    /// 卡片上还挂着「启动成功」，很容易被当成当前状态。
+    private func noteEngineResult(_ s: String) {
+        lastResult = s
+        DispatchQueue.main.asyncAfter(deadline: .now() + 25) { [weak self] in
+            guard let self = self else { return }
+            if self.lastResult == s { self.lastResult = "" }
         }
     }
 
@@ -6049,32 +6593,53 @@ final class AutoEngine: NSObject, ObservableObject {
     /// 也就是：先发 **303598** 让车机现在报一次，再查 **203100** 拿结果。
     /// 这里照它做，并把「发了什么 / 服务端怎么回 / 最后读到没读到」全记日志。
     func manualRefresh() {
-        // 下发前这条记录的时间戳，用来判断「后来读到的是不是新的」
-        let before = car?.reportedAt ?? 0
-        log("▶ 手动刷新：下发 303598（原版让车机现报的那条），随后轮询 203100")
+        // 下发前这两个时间戳，用来判断「后来读到的是不是新的」。
+        //
+        // 1.44：以前只记 `reportedAt`（= tdt，定位时间）。车停着不动时 tdt
+        // 几小时都不变，于是每次刷新都判成「车机没报新数据」—— 明明服务端
+        // 3 分钟前刚收到车机心跳，提示却在说失联。现在两个都记：tdt 看位置
+        // 有没有挪，sdt 看车机还活着没。
+        // 连点两下会并发两条查询、两个轮询，结论互相覆盖。直接挡住。
+        guard !refreshing else { return }
+        refreshing = true
+        refreshSeq += 1
+        let seq = refreshSeq
+        // 兜底：正常路径由 pollFresh 收尾；万一底层连接卡死没回调，
+        // 也不能让按钮永远灰着（用户会以为刷新坏了）。
+        DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in
+            guard let self = self else { return }
+            if self.refreshSeq == seq { self.refreshing = false }
+        }
+        let beforeTdt = car?.tdt ?? 0
+        let beforeSdt = car?.sdt ?? 0
+        refreshNote = "正在读取最新状态…"
+        // 1.47 对齐原版：原版「刷新」按钮走的是 `SendAction.queryDevStForce()`
+        // = `callAction("actions.device.203100", -1, "")`，就一条查询，没有别的。
+        // 1.42~1.46 这里先发 303598 再干等 65 秒回执 —— 实测 303598 根本不会让
+        // 车机额外应答（1.45 三轮验证），等于每次刷新都白挂一条连接 65 秒。
+        log("▶ 手动刷新：读 203100（= 原版 queryDevStForce）")
         ensureSession { ok in
             guard ok else {
-                self.log("⚠ 没有有效会话，指令没发出去；只读一次缓存")
-                self.refreshStatus { c in
-                    self.log(c == nil ? "✗ 缓存也读不到" : "· 读到的是缓存，不是实时上报")
-                }
+                self.refreshing = false
+                self.noteRefresh("没有有效会话，读取失败")
+                self.log("⚠ 没有有效会话，刷新没做成")
                 return
             }
-            DispatchQueue.global(qos: .userInitiated).async {
-                do {
-                    let r = try self.api.reportNow()
-                    if r.ok {
-                        self.log("· 303598 已受理（" + (r.code.isEmpty ? "S" : r.code) + "）")
-                    } else {
-                        self.log("✗ 303598 被拒 " + r.code + " " + r.msg + "（仍会去读一次缓存）")
-                    }
-                } catch {
-                    self.log("✗ 303598 没发出去：" + error.localizedDescription)
-                }
-                DispatchQueue.main.async {
-                    self.pollFresh(before: before, left: 6, spent: 0)
-                }
+            DispatchQueue.main.async {
+                // 5 拍 × 2 秒：203100 是秒回的（不是等车机回执的控制类），
+                // 通常第一拍就拿到；后面几拍是防服务端抖动。
+                self.pollFresh(tdt0: beforeTdt, sdt0: beforeSdt, left: 5, spent: 0)
             }
+        }
+    }
+
+    /// 写一句刷新结论，90 秒后自动清掉 —— 否则半天后再看卡片，
+    /// 还挂着「✓ 车机在线（22:58 有上报）」这种早过期的结论。
+    private func noteRefresh(_ s: String) {
+        refreshNote = s
+        DispatchQueue.main.asyncAfter(deadline: .now() + 90) { [weak self] in
+            guard let self = self else { return }
+            if self.refreshNote == s { self.refreshNote = "" }
         }
     }
 
@@ -6083,24 +6648,62 @@ final class AutoEngine: NSObject, ObservableObject {
     /// 303598 只是「通知车机去报」，车机走 2G/4G 回来要几秒到十几秒，
     /// 这一刻平台里还是旧数据。以前只等 2.5 秒读一次，多半读到的还是旧的，
     /// 看着就像「指令没生效」。原版是 1.9 秒后读一次、同时靠 202110 推送补；
-    /// 我们没有长连接，所以改成每 2 秒读一次、最多 6 次（12 秒），
-    /// 读到时间戳比 `before` 新就收工。
-    private func pollFresh(before: Int64, left: Int, spent: Int) {
+    /// 我们没有长连接，所以改成每 2 秒读一次、最多 15 次（30 秒）。
+    ///
+    /// 1.44 判定规则（实测出来的，别改回去）：
+    /// - `tdt` 变新 → 位置真的更新了，立刻收工；
+    /// - `tdt` 没变但 `sdt` 在 4 分钟内 → **车机是活的**，平台里这条就是最新
+    ///   数据（车没动，位置本就不该变），算刷新成功，不用干等 30 秒；
+    /// - 两个都旧 → 车机真没响应，把「最后上报在几点」写出来。
+    private func pollFresh(tdt0: Int64, sdt0: Int64, left: Int, spent: Int) {
         refreshStatus { c in
             if let c = c {
-                let ts = c.reportedAt > 0 ? c.reportedAt : c.fetchedAt
-                if before <= 0 || ts > before {
-                    let when = CarAPI.fmt("HH:mm:ss", Date(timeIntervalSince1970: Double(ts) / 1000))
-                    self.log("✓ 状态已刷新（等了 " + String(spent) + " 秒），车机上报时间 " + when)
+                let tdt = c.tdt > 0 ? c.tdt : 0
+                let sdt = c.sdt > 0 ? c.sdt : 0
+                let posNew = tdt0 > 0 && tdt > tdt0
+                let beatNew = sdt0 > 0 && sdt > sdt0
+                if posNew || beatNew {
+                    if posNew {
+                        let when = CarAPI.fmt("HH:mm:ss", Date(timeIntervalSince1970: Double(tdt)))
+                        self.noteRefresh("✓ 位置已更新到 " + when)
+                        self.log("✓ 状态已刷新（等了 " + String(spent) + " 秒），位置时间 " + when)
+                    } else {
+                        let when = CarAPI.fmt("HH:mm", Date(timeIntervalSince1970: Double(sdt)))
+                        self.noteRefresh("✓ 车机在线（" + when + " 有上报），位置没变")
+                        self.log("✓ 车机有回（等了 " + String(spent) + " 秒），位置没动，数据已是最新")
+                    }
+                    self.refreshing = false
+                    return
+                }
+                // 6 秒后还没等到变化：只要车机最近 4 分钟内报过，就已经是最新数据了
+                let ageSec = CarAPI.nowMs() / 1000 - sdt
+                if spent >= 6 && sdt > 0 && ageSec <= 240 {
+                    let when = CarAPI.fmt("HH:mm", Date(timeIntervalSince1970: Double(sdt)))
+                    let mins = Int(max(0, ageSec) / 60)
+                    self.noteRefresh("✓ 车机在线（" + when + " 有上报，\(mins) 分钟前），位置没变")
+                    self.log("✓ 车机在线（等了 " + String(spent) + " 秒），\(mins) 分钟前有上报，车停着位置不会变")
+                    self.refreshing = false
                     return
                 }
             }
             guard left > 1 else {
-                self.log("✗ 等了 12 秒车机还没报新数据（可能休眠、信号差，或本来就停在原地没上报）")
+                // 读不到新数据也要把「车机最后一次上报是什么时候」写清楚，
+                // 否则用户只看到界面数字没变，没法判断是车没动还是指令没生效。
+                var tail = ""
+                var head = "✗ 车机没响应"
+                if let c = c, c.sdt > 0 {
+                    let mins = Int(max(0, CarAPI.nowMs() / 1000 - c.sdt) / 60)
+                    tail = "；车机最后上报 " + CarAPI.fmt("MM-dd HH:mm",
+                            Date(timeIntervalSince1970: Double(c.sdt))) + "（\(mins) 分钟前）"
+                    head = "✗ 车机没响应 · 最后上报 \(mins) 分钟前"
+                }
+                self.refreshing = false
+                self.noteRefresh(head)
+                self.log("✗ 读了 8 秒车机还是老数据" + tail + "（休眠、信号差，或车停着没动）")
                 return
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-                self.pollFresh(before: before, left: left - 1, spent: spent + 2)
+                self.pollFresh(tdt0: tdt0, sdt0: sdt0, left: left - 1, spent: spent + 2)
             }
         }
     }
@@ -6116,8 +6719,12 @@ final class AutoEngine: NSObject, ObservableObject {
     /// 指令码是从服务器下发的配置里读的（键名 `dayqry`），包里没有写死，
     /// 所以这里退一步，按天问、按天存。等哪天抓到那个码，换成一次拿一个月即可。
     ///
+    /// `progress(got)`：每补到一天就回调一次（主线程），界面可以边补边显示，
+    ///                  不用等 30 天全部问完才出东西。
     /// `done(got)`：got 是补到天数的条数；-1 表示没有有效会话。
-    func syncHistory(days: Int, done: @escaping (Int) -> Void) {
+    func syncHistory(days: Int,
+                     progress: @escaping (Int) -> Void = { _ in },
+                     done: @escaping (Int) -> Void) {
         let n = max(1, min(31, days))
         ensureSession { ok in
             guard ok else {
@@ -6127,18 +6734,39 @@ final class AutoEngine: NSObject, ObservableObject {
             }
             DispatchQueue.global(qos: .userInitiated).async {
                 var got = 0
+                var skipped = 0
                 let cal = Calendar.current
                 let today = cal.startOfDay(for: Date())
                 for i in 0..<n {
                     guard let d = cal.date(byAdding: .day, value: -i, to: today) else { continue }
                     let sec = Int64(d.timeIntervalSince1970)
                     let key = TrackStore.key(d)
+
+                    // 本地已经有这一天了就别再问一次：
+                    //  · 今天 —— 本地是实时的，比服务端（有滞后）更全，本地有 2 点就够；
+                    //  · 往日 —— 50 点以上基本是上次从服务端补回来的整天，不必重拉。
+                    // 这一步让「第二次进历史页」几乎不发请求。
+                    let have = TrackStore.shared.points(day: key).count
+                    if (i == 0 && have >= 2) || (i > 0 && have >= 50) {
+                        skipped += 1
+                        continue
+                    }
+
                     do {
                         let pts = try self.api.historyPath(dayStartSec: sec)
                         if pts.count >= 2 {
                             TrackStore.shared.merge(day: key, pts: pts)
                             got += 1
-                            self.log("· 历史 " + key + "：" + String(pts.count) + " 点")
+                            // 带上首末时间：能一眼看出补回来的是整天还是只有一段
+                            var span = ""
+                            if let a = pts.first?.ts, let b = pts.last?.ts, a > 0, b > 0 {
+                                span = " " + CarAPI.fmt("HH:mm", Date(timeIntervalSince1970: Double(a) / 1000))
+                                     + "–" + CarAPI.fmt("HH:mm", Date(timeIntervalSince1970: Double(b) / 1000))
+                            }
+                            self.log("· 历史 " + key + "：" + String(pts.count) + " 点" + span)
+                            // 边补边通知界面：第一条就立刻能看见，不用等 30 天
+                            let g = got
+                            DispatchQueue.main.async { progress(g) }
                         } else {
                             self.log("· 历史 " + key + "：服务端没有点")
                         }
@@ -6146,6 +6774,9 @@ final class AutoEngine: NSObject, ObservableObject {
                         let m = (error as? LocalizedError)?.errorDescription ?? "\(error)"
                         self.log("✗ 历史 " + key + "：" + m)
                     }
+                }
+                if skipped > 0 {
+                    self.log("· 历史：本地已有 " + String(skipped) + " 天，跳过没再问")
                 }
                 DispatchQueue.main.async { done(got) }
             }
@@ -6220,29 +6851,286 @@ final class AutoEngine: NSObject, ObservableObject {
                 let c = self.api.status()
                 DispatchQueue.main.async {
                     guard epoch == self.sessionEpoch, let c = c else { done?(nil); return }
-                    self.car = c
-                    // 1.35：顺手落一个轨迹点。放这里而不是地图页里，是因为轨迹要在
-                    // 「后台也是一直在查状态」的情况下才连贯 —— 地图页关掉也得记。
-                    // 15 米内的重复点 TrackStore 自己会丢。
-                    // 1.38：带上速度 —— 原版回放时每个点都显示 KM/H，
-                    // 没有速度这一列，回放页那行数字就是空的。
-                    TrackStore.shared.append(lat: Double(c.lat) ?? 0,
-                                             lng: Double(c.lng) ?? 0,
-                                             at: c.reportedAt > 0 ? c.reportedAt : c.fetchedAt,
-                                             kph: Double(c.speedKph))
-                    self.updateVehState(acc: c.acc, eng: c.eng, speedKph: c.speedKph)
-                    self.checkBatteryLow(c.volt)
-                    self.resolvePlace(c)
-                    if c.reportedAt > 0 {
-                        // 1.15 的修复搬过来：这里以前是直接 `armed = c.armed`，
-                        // 绕过了「车辆自锁抑制」。蓝牙断着、只能靠网络查状态时，
-                        // 熄火关门车自己上锁，人还在旁边，下一拍就会把车又解开。
-                        self.applyArmed(c.armed)
-                        // 网络状态是权威的，可直接用来核实蓝牙回执
-                        self.checkVerify(now: CarAPI.nowMs())
-                    }
+                    self.applyCar(c)
                     done?(c)
                 }
+            }
+        }
+    }
+
+    /// 把一条状态落到界面上。1.46 从 `refreshStatus` 里抽出来，
+    /// 因为现在有两条路会拿到状态（普通查询 / 长连接轮询），落的动作必须完全一样，
+    /// 否则长连接那条会少记轨迹点或少算车门，两边数据就对不上了。
+    private func applyCar(_ c: CarAPI.Car) {
+        car = c
+        // 1.35：顺手落一个轨迹点。放这里而不是地图页里，是因为轨迹要在
+        // 「后台也是一直在查状态」的情况下才连贯 —— 地图页关掉也得记。
+        // 15 米内的重复点 TrackStore 自己会丢。
+        // 1.38：带上速度 —— 原版回放时每个点都显示 KM/H，
+        // 没有速度这一列，回放页那行数字就是空的。
+        TrackStore.shared.append(lat: Double(c.lat) ?? 0,
+                                 lng: Double(c.lng) ?? 0,
+                                 at: c.reportedAt > 0 ? c.reportedAt : c.fetchedAt,
+                                 kph: Double(c.speedKph))
+        updateVehState(acc: c.acc, eng: c.eng, speedKph: c.speedKph)
+        checkBatteryLow(c.volt)
+        resolvePlace(c)
+        if c.reportedAt > 0 {
+            // 1.15 的修复搬过来：这里以前是直接 `armed = c.armed`，
+            // 绕过了「车辆自锁抑制」。蓝牙断着、只能靠网络查状态时，
+            // 熄火关门车自己上锁，人还在旁边，下一拍就会把车又解开。
+            applyArmed(c.armed)
+            // 网络状态是权威的，可直接用来核实蓝牙回执
+            checkVerify(now: CarAPI.nowMs())
+        }
+    }
+
+    // MARK: 状态推送长连接（1.47）
+
+    /// **3011 端口的状态订阅**，这才是原版真正的实时通道。
+    ///
+    /// 1.46 我下过「这套协议没有推送」的结论，那是错的：当时拿 3050 的报文格式
+    /// （8 字节十进制长度 + JSON + 签名）去连 3010/3011，服务端当然不理。
+    /// 原版 `ConnTcpStatus$TcpThread.sendMsg()` 用的是完全不同的二进制头
+    /// `'$' + 02 + 4位十六进制长度 + 8字节uid + 02`，而且连的是 **3011**
+    /// （`SendTcpStatus.send()` 取 `getPortStatus2()`）。
+    ///
+    /// 实测：订阅一条 203100 之后，服务端主动推完整状态，并每 8 秒发一个 `^` 心跳；
+    /// 车机每次上报都会推过来 —— 这就是「车一动手机立刻变」的来源，
+    /// 不再是 15 秒一轮的干等。
+    private var pushLink: PushLink?
+    /// 正在等登录完再订阅，防止回前台连点两次建出两条连接
+    private var pushStarting = false
+    /// 推送连不上时的兜底：复用连接轮询（1.46 的做法，保留）
+    private var liveConn: NetConn?
+    private var liveTimer: Timer?
+    private var liveFails = 0
+    /// 兜底查询自己的失败计数（和推送分开，免得互相把对方的计数清零）
+    private var pollFails = 0
+    /// 推送连续失败几次后降级成轮询
+    private let pushGiveUp = 6
+    /// 界面上显示长连接状态
+    @Published var liveNote = ""
+
+    func startLiveLink() {
+        guard store.liveLink else { return }
+        if pushLink != nil || pushStarting { return }
+        pushStarting = true
+        liveFails = 0
+        liveNote = "连接推送中…"
+        log("· 状态推送：连 3011 订阅 " + CarAPI.CODE_STATUS)
+        // 会话没有就先登录，登录完再订阅（uid/ssk 都是登录才有的）
+        ensureSession { ok in
+            self.pushStarting = false
+            guard ok, self.running, self.store.liveLink else {
+                if !ok { self.liveNote = "没有会话，推送没连上" }
+                return
+            }
+            self.openPush()
+            // 推送管「有变化立刻知道」，这条管「没变化时也知道车机还活着」
+            self.startLivePoll()
+        }
+    }
+
+    /// 建一条新的推送连接。断线重连由 `PushLink` 自己处理（1 秒后重订），
+    /// 这里只在「彻底不行」时降级成轮询。
+    private func openPush() {
+        pushLink?.stop()
+        let link = PushLink()
+        pushLink = link
+
+        link.onState = { [weak self] ok, msg in
+            guard let self = self else { return }
+            DispatchQueue.main.async {
+                guard self.pushLink === link else { return }
+                if ok {
+                    self.liveFails = 0
+                    self.liveNote = "推送已订阅 · 等车机上报"
+                } else {
+                    self.liveFails += 1
+                    // 短暂断线由 PushLink 自己重连（1 秒一次）。连 6 次都不成就
+                    // 说明这条路在当前网络下走不通，停掉推送、只留 30 秒兜底查询；
+                    // 等下次回到前台会再试一次。
+                    if self.liveFails >= self.pushGiveUp {
+                        self.log("⚠ 推送连续 \(self.liveFails) 次连不上，暂停推送，只走 30 秒查询：" + msg)
+                        self.pushLink?.stop()
+                        self.pushLink = nil
+                        self.liveNote = "推送不可用 · 30 秒查询中"
+                    } else {
+                        self.liveNote = "推送重连中（第 \(self.liveFails) 次）"
+                    }
+                }
+            }
+        }
+
+        link.onText = { [weak self] text in
+            guard let self = self else { return }
+            guard let c = CarAPI.parseStatusText(text) else { return }
+            DispatchQueue.main.async {
+                guard self.pushLink === link else { return }
+                self.liveFails = 0
+                let sdt = c.sdt > 0 ? c.sdt : c.tdt
+                self.liveNote = sdt > 0
+                    ? "推送正常 · 车机 " + CarAPI.fmt("HH:mm:ss",
+                        Date(timeIntervalSince1970: Double(sdt))) + " 上报"
+                    : "推送正常"
+                self.applyCar(c)
+            }
+        }
+
+        link.onBeat = { [weak self] in
+            guard let self = self else { return }
+            DispatchQueue.main.async {
+                guard self.pushLink === link, self.liveFails == 0 else { return }
+                // 心跳每 8 秒一个，只证明连接活着；界面上不刷屏，
+                // 只有在还没有任何状态推送时才用它安抚一下。
+                if self.liveNote.hasPrefix("推送已订阅") {
+                    self.liveNote = "推送在线 · 等车机上报"
+                }
+            }
+        }
+
+        link.start(json: api.statusSubscribeJson(), uid: api.uid)
+    }
+
+    /// 推送不可用时的兜底，也是**推送的常规补充**：复用一条 3050 连接，
+    /// 每 30 秒读一次 203100。
+    ///
+    /// 为什么推送之外还要它：实测（00:1x）车停着时车机每 183 秒照常上报，
+    /// 但 3011 订阅端 120 秒一条都没收到 —— 服务端**只在状态真的变了才推**
+    /// （车在动的那次，36 秒内连推 3 条）。所以「停车时界面上车机多久前上报」
+    /// 这类信息，只能靠主动查。原版也是这个结构：`SendTcpStatus` 管推送，
+    /// `SendAction.queryDevSt()` 管兜底查询，两条并行。
+    private func startLivePoll() {
+        guard liveTimer == nil else { return }
+        log("· 状态兜底查询已开（每 30 秒读一次 203100）")
+        let t = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+            self?.liveTick()
+        }
+        t.tolerance = 5
+        liveTimer = t
+        liveTick()
+    }
+
+    func stopLiveLink() {
+        let had = pushLink != nil || liveTimer != nil || liveConn != nil
+        pushLink?.stop()
+        pushLink = nil
+        liveTimer?.invalidate()
+        liveTimer = nil
+        liveConn?.close()
+        liveConn = nil
+        liveFails = 0
+        liveNote = ""
+        if had { log("· 状态推送已关") }
+    }
+
+    private func liveTick() {
+        guard running, store.liveLink else { return }
+        guard !netBusy() else { return }
+        guard api.hasSession else {
+            // 会话没了（刚冷启动、刚换账号、或者服务端把 ssk 收了）：
+            // 拉一次登录，下一拍照常跑。不在这里直接 return，否则长连接一旦
+            // 赶上「没有 ssk」的那一刻就永久停摆，界面还显示着「已开启」。
+            ensureSession { _ in }
+            return
+        }
+        let json = api.statusRequestJson()
+        let conn = liveConn ?? NetConn()
+        liveConn = conn
+        DispatchQueue.global(qos: .utility).async {
+            do {
+                let text = try conn.send(json, ioTimeoutSec: 10)
+                guard let c = CarAPI.parseStatusText(text) else {
+                    DispatchQueue.main.async {
+                        self.pollFails += 1
+                        if self.pushLink == nil { self.liveNote = "查询：回包解析不出来" }
+                    }
+                    return
+                }
+                DispatchQueue.main.async {
+                    self.pollFails = 0
+                    // 推送活着就以推送的文案为准，别两条路互相刷屏
+                    if self.pushLink == nil {
+                        let sdt = c.sdt > 0 ? c.sdt : c.tdt
+                        self.liveNote = sdt > 0
+                            ? "查询正常 · 车机 " + CarAPI.fmt("HH:mm:ss", Date(timeIntervalSince1970: Double(sdt))) + " 上报"
+                            : "查询正常"
+                    }
+                    self.applyCar(c)
+                }
+            } catch {
+                // 在 catch 里先把文案取出来：下面那个 escaping 闭包里再用
+                // 隐式的 `error` 容易让人看着别扭，也容易在重构时踩坑。
+                let msg = error.localizedDescription
+                DispatchQueue.main.async {
+                    self.pollFails += 1
+                    if self.pushLink == nil {
+                        self.liveNote = "查询断开，第 \(self.pollFails) 次"
+                    }
+                    // 连续 3 次（90 秒）都不行就收手，别一直空转耗电。
+                    // 自动刷新那条老路还在，功能不会断。
+                    if self.pollFails >= 3 {
+                        self.log("⚠ 状态查询连续失败 3 次，先停掉：" + msg)
+                        self.stopLiveLink()
+                    }
+                }
+            }
+        }
+    }
+
+    /// 有没有别的高优先级网络动作在跑（握手 / 登录）。
+    /// 登录中途去查状态会拿到「没有会话」，白跑一趟还刷一条错误日志。
+    private func netBusy() -> Bool {
+        return loginInFlight || acting
+    }
+
+    // MARK: 围栏守卫（1.43）
+
+    /// 只要 App 活着就每 60 秒判一次围栏。
+    ///
+    /// 为什么单独一个定时器：以前判定只挂在 MapPage 的 onAppear 和「实时追踪」
+    /// 那个 60 秒循环里 —— 用户不进地图页、不点实时追踪，围栏就只是个画在地上
+    /// 的圈。原版是车机自己判、越界由服务端推 ActionMapWarn，所以它 App 没开
+    /// 也报警；我们没有长连接，做不到那一步，但至少不该依赖用户点了哪个按钮。
+    private func startFenceWatch() {
+        guard fenceWatchTimer == nil else { return }
+        let t = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            self?.fenceWatchTick()
+        }
+        // 容差让它跟别的唤醒合并，不必每分钟硬醒
+        t.tolerance = 12
+        fenceWatchTimer = t
+        fenceWatchTick()
+    }
+
+    private func fenceWatchTick() {
+        guard fenceEnabled else { return }
+        guard FenceStore.shared.list.contains(where: { $0.on }) else { return }
+        // 还没有车辆数据就先拉一次，下一轮再判 —— 否则冷启动后一直没点刷新
+        // 的话，围栏守卫等于空转。
+        if car == nil {
+            refreshStatus()
+            return
+        }
+        guard let c = car,
+              let lat = Double(c.lat), let lng = Double(c.lng),
+              lat != 0, lng != 0 else { return }
+
+        // FenceStore.evaluate 内部只在「圈内 ↔ 圈外」翻转时把 changed 置真，
+        // 所以这里和地图页各判一次也不会重复报。
+        let hits = FenceStore.shared.evaluate(lat: lat, lng: lng)
+        for h in hits where h.changed {
+            if !h.inside && h.fence.outAlert {
+                let body = "「" + h.fence.name + "」已出圈，直线距离 "
+                    + String(Int(h.meters)) + " 米"
+                Notify.shared.fenceAlert(title: "车辆离开围栏", body: body)
+                log("⚠ 车辆离开围栏 " + body)
+            } else if h.inside && h.fence.inAlert {
+                let body = "「" + h.fence.name + "」已进圈，直线距离 "
+                    + String(Int(h.meters)) + " 米"
+                Notify.shared.fenceAlert(title: "车辆进入围栏", body: body)
+                log("⚠ 车辆进入围栏 " + body)
             }
         }
     }
@@ -6253,6 +7141,7 @@ final class AutoEngine: NSObject, ObservableObject {
     /// 之前的版本用「回前台补一次」就是这个原因。
     private func startAutoRefresh() {
         autoRefreshEnabled = store.autoRefresh
+        liveLinkOn = store.liveLink
         guard store.autoRefresh, autoRefreshTimer == nil else { return }
         let t = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             self?.autoRefreshTick()
@@ -6278,6 +7167,24 @@ final class AutoEngine: NSObject, ObservableObject {
         } else {
             stopAutoRefresh()
             log("· 自动刷新已关闭")
+        }
+    }
+
+    /// 界面上的「状态长连接」开关。
+    func setLiveLink(_ on: Bool) {
+        store.liveLink = on
+        liveLinkOn = on
+        if on {
+            if running {
+                startLiveLink()
+            } else {
+                log("· 状态推送已开，自动模式打开后生效")
+                liveNote = "已开启，自动模式打开后生效"
+            }
+        } else {
+            stopLiveLink()
+            log("· 状态推送已关闭，退回 5 分钟自动刷新")
+            liveNote = ""
         }
     }
 
@@ -6348,6 +7255,11 @@ final class AutoEngine: NSObject, ObservableObject {
         refreshStats()
         startAutoRefresh()
         if running {
+            // 1.47：推送的 socket 进后台必被系统掐掉，回前台得重新订阅。
+            // 已经活着就不动，避免每次切前后台都重连一次。
+            if store.liveLink && pushLink == nil {
+                startLiveLink()
+            }
             // 定位不再在这里拉起：1.25 起它完全由 decideAction 按「蓝牙有没有信号」决定，
             // 回前台先催一次连接 —— 连上了就一分钱定位电都不花。
             ble.ensureConnected()
@@ -6361,6 +7273,15 @@ final class AutoEngine: NSObject, ObservableObject {
         isBackground = true
         // Timer 进后台必被系统挂起，留着只会让人以为还在刷新
         stopAutoRefresh()
+
+        // 1.47：推送长连接在 App 被挂起后不可能存活，主动收掉比留个半死
+        // 的 fd 好 —— 回前台由 onForeground 重新订阅。
+        pushLink?.stop()
+        pushLink = nil
+        liveTimer?.invalidate()
+        liveTimer = nil
+        liveConn?.close()
+        liveConn = nil
 
         // 后台第一件事：把这次连接请求交给系统。
         //
@@ -7372,9 +8293,13 @@ struct MainView: View {
                 }
 
                 if !e.lastResult.isEmpty {
+                    // 1.48：成功绿、失败橙。以前一律灰色小字，「启动成功」和
+                    // 「启动超时」长得一模一样，扫一眼看不出成没成。
                     Text(e.lastResult)
-                        .font(.system(size: 12))
-                        .foregroundColor(UI.dim)
+                        .font(.system(size: 12, weight: e.lastResult.hasPrefix("✓") ? .semibold : .regular))
+                        .foregroundColor(e.lastResult.hasPrefix("✓") ? UI.ok
+                                         : (e.lastResult.hasPrefix("✗") ? UI.warn : UI.dim))
+                        .fixedSize(horizontal: false, vertical: true)
                 }
 
                 // 1.32：车辆所在地名。没填高德 key、或还没解析出来时，整行不显示。
@@ -7423,12 +8348,25 @@ struct MainView: View {
 
                 // 1.31：手动刷新不再置灰。自动刷新已经降到 5 分钟，这个按钮就是
                 // 用户想看最新状态时的唯一手段 —— 灰着不让人点，等于把兜底也拿走了。
-                GhostButton(title: "刷新车辆状态",
+                GhostButton(title: e.refreshing ? "读取中…" : "刷新车辆状态",
                             color: UI.accent,
-                            enabled: true) {
+                            enabled: !e.refreshing) {
                     // 1.41：203100 就是原版「强制查设备状态」（queryDevStForce），
-                    // 发完车机异步上报，引擎会每 2 秒读一次、最多等 12 秒
+                    // 1.47 起只发这一条（不再空挂 303598 等 65 秒）
                     e.manualRefresh()
+                }
+
+                // 1.44：刷完给一句话结论。以前结论只进日志，卡片上毫无反馈，
+                // 用户只能盯着没变的数字猜「到底刷没刷、是不是坏了」。
+                if !e.refreshNote.isEmpty {
+                    HStack(spacing: 6) {
+                        Text(e.refreshNote)
+                            .font(.system(size: 11))
+                            .foregroundColor(e.refreshNote.hasPrefix("✓") ? UI.ok
+                                             : (e.refreshNote.hasPrefix("✗") ? UI.warn : UI.dim))
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer(minLength: 0)
+                    }
                 }
             }
         }
@@ -7500,14 +8438,18 @@ struct MainView: View {
                     e.netOnly(unlock: false)
                 }
             }
+            // 1.48：两个按钮在执行期间都变灰并换文案。以前点下去除了右上角
+            // 那个小转圈没有任何硬反馈，手一抖就会再点一次、发第二条指令。
             HStack(spacing: 10) {
-                GhostButton(title: "一键启动", color: UI.ok,
-                            enabled: e.chMode != Logic.MODE_BLE) {
+                GhostButton(title: e.engineBusy == "start" ? "启动中…" : "一键启动",
+                            color: UI.ok,
+                            enabled: e.chMode != Logic.MODE_BLE && e.engineBusy.isEmpty) {
                     engineStart = true
                     showEngine = true
                 }
-                GhostButton(title: "熄火", color: UI.dim,
-                            enabled: e.chMode != Logic.MODE_BLE) {
+                GhostButton(title: e.engineBusy == "stop" ? "熄火中…" : "熄火",
+                            color: UI.dim,
+                            enabled: e.chMode != Logic.MODE_BLE && e.engineBusy.isEmpty) {
                     engineStart = false
                     showEngine = true
                 }
@@ -7636,6 +8578,24 @@ struct MainView: View {
                           "蓝牙断着时每 5 分钟查一次；蓝牙连着靠状态帧刷新，一次都不联网",
                           isOn: Binding(get: { e.autoRefreshEnabled },
                                         set: { e.setAutoRefresh($0) }))
+
+                // 1.47：状态推送（3011 端口订阅）。原版 `SendTcpStatus` 用的就是这条，
+                // 车机每上报一次服务端就推一次，8 秒一个心跳保活 —— 这才是真·实时，
+                // 不是靠高频轮询凑出来的「准实时」。
+                toggleRow("状态推送（实时）",
+                          "订阅车机状态推送，车一上报手机立刻更新；关掉就退回 5 分钟自动刷新",
+                          isOn: Binding(get: { e.liveLinkOn },
+                                        set: { e.setLiveLink($0) }))
+
+                if !e.liveNote.isEmpty {
+                    HStack(spacing: 6) {
+                        Text(e.liveNote)
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundColor(e.liveNote.hasPrefix("推送") || e.liveNote.hasPrefix("轮询正常")
+                                             ? UI.ok : UI.warn)
+                        Spacer(minLength: 0)
+                    }
+                }
 
                 // 1.33：高德 key 改成内置 + 隐藏入口。
                 // 内置 key 已经能显示地名，日常不需要看见这一行；长按最底下的版本号才展开。
@@ -8099,6 +9059,12 @@ struct CarMapView: UIViewRepresentable {
 //        所以这一版改成「按天问 901011、按天存本地」，界面照旧按天列。
 //      · 顺带修：1.39 删旧 sheet 时把地图上的轨迹线弄成了死代码（只剩 track = []），
 //        现在每次刷到新位置都重读本地轨迹库。
+//    1.42 真机实测（不是读代码，是真发了请求）——
+//      · 每行实际是 {"u":1794585600,"t":24.82118,"g":118.5854,"s":15,"d":100,"v":"140"}：
+//        u = unix **秒**、s = 速度 KM/H、d = 方向、v = 电压（14.0V）。
+//        所以**时间戳和速度都有**，时长/均速/最高速都能真算 ——
+//        1.40 里「服务端不给时间戳、只能显示 --」的说法是错的，已改。
+//      · 一天实测 804 点（00:00–11:57），连拉 7 天都有，接口对我们账号完全可用。
 //  · 导航到车 = ActionMapNavi：探测装了哪个地图——高德 com.autonavi.minimap、
 //    百度 com.baidu.BaiduMap、腾讯 com.tencent.map，用 URI 直接唤起并进驾车路线；
 //    一个都没装就开网页版。目的地取 lloc.lat / lloc.lng。
@@ -8139,6 +9105,9 @@ final class TrackStore {
         var maxKph: Double
         var startAt: Int64
         var endAt: Int64
+        /// 行驶时长（秒）：只算真的在动的那些间隔，停车不算。
+        /// 1.42 新增 —— 以前用 endAt-startAt，车停一天均速会掉到 0.5KM/H。
+        var movingSec: Int64
     }
 
     static let shared = TrackStore()
@@ -8227,20 +9196,38 @@ final class TrackStore {
         return f.string(from: date)
     }
 
-    /// 把服务端取回来的一天补进本地。
+    /// 把服务端取回来的一天并进本地。
     ///
-    /// 服务端只给坐标、不给时间戳，所以这些点的 ts 记 0 —— 时长和均速会显示
-    /// 「--」，里程和轨迹线照常。本地这一天已经有两个以上点就不动它：
-    /// 本地是 App 实时记的，比事后补的可信。
-    func merge(day key: String, pts coords: [(Double, Double)]) {
-        guard coords.count >= 2 else { return }
+    /// 1.42 订正两件事：
+    /// 1) 服务端**是给时间戳和速度的**（`u` 秒 / `s` KM/H），之前按「只给坐标」
+    ///    处理、把 ts 记 0，导致补回来的那几天时长和均速只能显示「--」；
+    /// 2) 以前「本地已有 2 个点就整天空着不动」，会让 App 顺手记的三五个点
+    ///    挡住服务端几百个点。现在改成**按时间取并集**：两边都留，同一时刻
+    ///    （8 秒内）只留一个，速度取大的那个。
+    func merge(day key: String, pts src: [CarAPI.HistoryPoint]) {
+        guard src.count >= 2 else { return }
         let url = fileURL(key)
-        if loadPts(url).count >= 2 { return }
-        var out: [Pt] = []
-        out.reserveCapacity(coords.count)
-        for c in coords {
-            out.append(Pt(lat: c.0, lng: c.1, ts: 0, kph: 0))
+        let local = loadPts(url)
+
+        var all: [Pt] = []
+        // 本地老数据里 ts==0 的是 1.40 补回来的「纯几何点」，服务端整天的点
+        // 已经覆盖它，丢掉，否则会排到 1970 去。
+        for p in local where p.ts > 0 { all.append(p) }
+        for p in src {
+            all.append(Pt(lat: p.lat, lng: p.lng, ts: p.ts, kph: p.kph))
         }
+        all.sort { $0.ts < $1.ts }
+
+        var out: [Pt] = []
+        out.reserveCapacity(all.count)
+        for p in all {
+            if let last = out.last, p.ts - last.ts < 8_000 {
+                if p.kph > last.kph { out[out.count - 1] = p }
+                continue
+            }
+            out.append(p)
+        }
+        guard out.count >= 2 else { return }
         savePts(out, to: url)
     }
 
@@ -8279,11 +9266,31 @@ final class TrackStore {
             var maxV = 0.0
             var sumV = 0.0
             var nV = 0
+            // 行驶时间：只累计「确实在动」的那几段。
+            // 不能用首末时间相减 —— 车停 8 小时也在这段里，均速会算成 0.5KM/H。
+            var movingSec = 0.0
+            // 老数据（1.40 及以前）没有时间戳，只能退回「把所有段都算上」的旧口径
+            let hasTs = pts.contains { $0.ts > 0 }
             if pts.count >= 2 {
                 for i in 1..<pts.count {
                     let a = CLLocation(latitude: pts[i - 1].lat, longitude: pts[i - 1].lng)
                     let b = CLLocation(latitude: pts[i].lat, longitude: pts[i].lng)
-                    km += a.distance(from: b)
+                    let d = a.distance(from: b)
+                    let dt = Double(pts[i].ts - pts[i - 1].ts) / 1000.0
+                    if !hasTs {
+                        km += d
+                        continue
+                    }
+                    // 超过 10 分钟的间隔是熄火/离网，不当作行驶；
+                    // 速度低于 2KM/H 的是静止时的定位漂移，不能算里程（几百个点
+                    // 各漂 5 米，一天能虚增好几公里）。
+                    if dt > 0, dt < 600 {
+                        let kph = d / dt * 3.6
+                        if kph >= 2 {
+                            km += d
+                            movingSec += dt
+                        }
+                    }
                 }
             }
             for p in pts {
@@ -8295,8 +9302,8 @@ final class TrackStore {
             let s = pts.first?.ts ?? 0
             let e = pts.last?.ts ?? 0
             var avg = 0.0
-            if e > s {
-                avg = km / (Double(e - s) / 3_600_000.0)
+            if movingSec >= 30 {
+                avg = km / (movingSec / 3600.0)
             } else if nV > 0 {
                 avg = sumV / Double(nV)
             }
@@ -8308,7 +9315,8 @@ final class TrackStore {
                            avgKph: avg,
                            maxKph: maxV,
                            startAt: s,
-                           endAt: e))
+                           endAt: e,
+                           movingSec: Int64(movingSec)))
         }
         out.sort { $0.key > $1.key }
         if out.count > 31 { return Array(out.prefix(31)) }
@@ -8444,6 +9452,46 @@ final class FenceStore {
                      lat: lat, lng: lng,
                      radius: 500,
                      on: true)
+    }
+
+    // MARK: 越界判定（1.43：从地图页里拆出来，App 在前台就一直判）
+
+    /// 一次判定的结果。
+    struct Hit {
+        var fence: Fence
+        var inside: Bool      // 现在在圈内
+        var changed: Bool     // 和上一次比变了；首次判定为 false
+        var meters: Double    // 车到圆心的直线距离
+    }
+
+    /// 上一次每个围栏的内外状态。判定只在「状态翻转」时发一次，不会每 60 秒重复报。
+    private var lastInside: [String: Bool] = [:]
+
+    /// 用车的当前位置把所有开着的围栏判一遍。
+    ///
+    /// 车坐标和围栏圆心都是 WGS-84（画到地图上才换算），所以这里直接比，
+    /// 距离是对的。`lat/lng` 传 0 表示没有定位，直接返回空。
+    func evaluate(lat: Double, lng: Double) -> [Hit] {
+        guard lat != 0, lng != 0, lat.isFinite, lng.isFinite else { return [] }
+        let car = CLLocation(latitude: lat, longitude: lng)
+        var out: [Hit] = []
+        for f in list where f.on {
+            guard f.lat != 0, f.lng != 0 else { continue }
+            let d = car.distance(from: CLLocation(latitude: f.lat, longitude: f.lng))
+            let inside = d <= f.radius
+            let was = lastInside[f.id]
+            lastInside[f.id] = inside
+            out.append(Hit(fence: f,
+                           inside: inside,
+                           // 首次见到这个围栏（was == nil）不算「变化」，
+                           // 否则一启动就会因为「本来就在圈外」炸一条报警
+                           changed: (was.map { $0 != inside }) ?? false,
+                           meters: d))
+        }
+        // 删掉的围栏把状态一起清掉，免得字典越积越大
+        let live = Set(list.map { $0.id })
+        lastInside = lastInside.filter { live.contains($0.key) }
+        return out
     }
 }
 
@@ -9012,15 +10060,18 @@ struct MapPage: View {
                 panelLink("chevron.left", "返回") { isPresented = false }
                 panelLink("location.fill", "我的位置") { jumpToMe() }
                 panelLink("arrow.clockwise", "刷新") {
-                    hint = "已让车机现报，最多等 12 秒"
+                    hint = "正在读取最新状态，最多等半分钟"
                     e.manualRefresh()
                     updateDistance()
-                    // 引擎是每 2 秒读一次、最多 12 秒。轨迹线在两个时间点各补刷一次，
-                    // 车机回得早就 4 秒补上，回得晚就等 13 秒那次。
+                    // 引擎是每 2 秒读一次、最多 15 轮（30 秒）。轨迹线在这三个
+                    // 时间点各补刷一次：车机回得快 4 秒就补上，回得慢也能覆盖到。
                     DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) {
                         self.refreshTrackLine()
                     }
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 13.0) {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 14.0) {
+                        self.refreshTrackLine()
+                    }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 31.0) {
                         self.refreshTrackLine()
                     }
                 }
@@ -9202,14 +10253,16 @@ struct MapPage: View {
 
     // MARK: 实时追踪（照原版 TrackFlowController）
 
-    /// 原版是定时器循环：每 60 秒一轮，先发 303598 叫车机现报一次，
-    /// 1.9 秒后读 203100 拿结果；地图跟着车走，同时算手机到车的距离。
+    /// 原版是定时器循环：每 60 秒一轮，先发 303598、1.9 秒后读 203100 拿结果；
+    /// 地图跟着车走，同时算手机到车的距离。
     ///
-    /// 1.41 订正：以前这里只调 refreshStatus()（= 只读 203100），注释还写着
-    /// 「iOS 包没有 303598 这个码」—— 那个判断是错的。指令码是**服务端**的
-    /// txncode，跟客户端是安卓还是 iOS 无关（我们连的就是同一个 www.zxy268.com，
-    /// chnl 也照样报 android）。所以这里改成调 manualRefresh()，和原版一致：
-    /// 先催车机报，再轮询读回。
+    /// 1.45 实测：303598 **不会**让车机额外应答一次。车通电时连测三轮，
+    /// 车机的上报节奏始终是它自己的 46 秒（停车时 183 秒），一秒都没被提前。
+    ///
+    /// 1.47 订正：原版真正靠的是 **3011 端口的状态订阅**（`SendTcpStatus`），
+    /// 车机一上报服务端就推过来 —— 那条通道已经接到 `AutoEngine.startLiveLink()`。
+    /// 于是这里的 60 秒定时器只是「地图跟着车走」的补充，实际位置由推送实时更新；
+    /// `manualRefresh()` 也同步收敛成原版的 `queryDevStForce`：只读 203100。
     private func toggleTracking() {
         if tracking {
             stopTracking()
@@ -9220,8 +10273,8 @@ struct MapPage: View {
         tracking = true
         follow = true
         recenter += 1
-        hint = "实时追踪已开 · 每 60 秒让车机现报一次"
-        e.log("▶ 开始实时追踪（60 秒一轮，先 303598 再读 203100）")
+        hint = "实时追踪已开 · 每 60 秒取一次最新位置"
+        e.log("▶ 开始实时追踪（位置靠推送实时更新，60 秒补读一次 203100）")
         e.manualRefresh()
         trackTimer = Timer.scheduledTimer(withTimeInterval: 60.0, repeats: true) { _ in
             // 闭包里一律显式写 self：SXKC 是 struct，Swift 在 escaping 闭包中
@@ -9292,23 +10345,24 @@ struct MapPage: View {
     /// 1.39：按每个围栏自己的两个开关分别判 —— 入圈报警 / 出圈报警，
     /// 跟原版编辑页那两行 Toggle 一一对应。第一次见到这个围栏只记方向、
     /// 不报警，否则一打开地图页就会因为"本来就在圈外"炸一条通知出来。
+    ///
+    /// 1.43：判定搬到了 FenceStore.evaluate（App 在后台时的 60 秒那一轮也用它），
+    /// 这里只负责把状态同步到界面、并在翻转时弹提示。
     private func checkFences() {
         guard let p = carLatLng else { return }
-        let car = CLLocation(latitude: p.0, longitude: p.1)
-        for f in fences {
-            if !f.on { continue }
-            let d = car.distance(from: CLLocation(latitude: f.lat, longitude: f.lng))
-            let inside = d <= f.radius
-            let was = inFence[f.id]
-            inFence[f.id] = inside
-            if was == nil { continue }
-            if was == true, !inside, f.outAlert {
+        let hits = FenceStore.shared.evaluate(lat: p.0, lng: p.1)
+        for h in hits {
+            inFence[h.fence.id] = h.inside
+            guard h.changed else { continue }
+            if !h.inside, h.fence.outAlert {
                 alert("车辆离开围栏",
-                      "「" + f.name + "」已出圈，直线距离 " + String(Int(d)) + " 米")
+                      "「" + h.fence.name + "」已出圈，直线距离 "
+                      + String(Int(h.meters)) + " 米")
             }
-            if was == false, inside, f.inAlert {
+            if h.inside, h.fence.inAlert {
                 alert("车辆进入围栏",
-                      "「" + f.name + "」已进圈，直线距离 " + String(Int(d)) + " 米")
+                      "「" + h.fence.name + "」已进圈，直线距离 "
+                      + String(Int(h.meters)) + " 米")
             }
         }
     }
@@ -10056,7 +11110,6 @@ struct HistoryPage: View {
     // 1.40：从车机补历史
     @State private var syncing = false
     @State private var syncNote = ""
-    @State private var autoTried = false
 
     @State private var raw: [TrackStore.Pt] = []
     @State private var pts: [CLLocationCoordinate2D] = []
@@ -10093,12 +11146,10 @@ struct HistoryPage: View {
         .background(UI.bg)
         .onAppear {
             load()
-            // 本机没有轨迹就自动向车机要一次（只读）。每次打开只试一回，
-            // 免得连不上时每进一次页面打 7 个请求。
-            if days.isEmpty && !autoTried {
-                autoTried = true
-                syncFromCar()
-            }
+            // 1.42：不再只在「本机一条都没有」时才去要。
+            // 本机记录的只是 App 开着那几段，服务端那份才是整天完整的，
+            // 所以进来就对一次（10 分钟内重复进页面不再打请求）。
+            autoSyncFromCar()
         }
         .onDisappear { stopTimer() }
     }
@@ -10316,34 +11367,54 @@ struct HistoryPage: View {
         .disabled(syncing)
     }
 
+    /// 进页面自动补一次。10 分钟内重复进页面不再打请求 ——
+    /// 每次 7 条 901011，虽然只读，也没必要反复问。
+    private func autoSyncFromCar() {
+        let k = "hist_auto_sync_at"
+        let last = UserDefaults.standard.double(forKey: k)
+        let now = Date().timeIntervalSince1970
+        if now - last < 600 { return }
+        UserDefaults.standard.set(now, forKey: k)
+        syncFromCar()
+    }
+
     private func syncFromCar() {
         guard !syncing else { return }
         syncing = true
-        syncNote = "正在向车机要最近 7 天…"
-        e.syncHistory(days: 7) { got in
+        syncNote = "正在向车机要最近 30 天…（先出最近的，边补边显示）"
+        e.syncHistory(days: 30, progress: { got in
+            // 边补边刷新：补到第一天就能看见，不用等 30 条全部问完
+            if got == 1 {
+                self.syncNote = "已经在出最近的几天…"
+                self.load()
+            }
+        }, done: { got in
             // 这里是 escaping 闭包，struct 里必须显式写 self
             self.syncing = false
+            self.load()
             if got < 0 {
                 self.syncNote = "没有有效会话，回设置里重新登录一次再试"
             } else if got == 0 {
-                self.syncNote = "车机那边这 7 天没有轨迹。（详情看运行日志里的「历史」几行）"
+                // 分两种：本来就空，还是「本机已经有了所以没再拉」
+                self.syncNote = self.days.isEmpty
+                    ? "车机那边这 30 天没有轨迹。（详情看运行日志里的「历史」几行）"
+                    : "本机已经是最新的（30 天都在），没重复去拉"
             } else {
                 self.syncNote = "补到 " + String(got) + " 天，已按天列出来"
             }
-            self.load()
-        }
+        })
     }
 
     private var emptyView: some View {
         ScrollView {
             VStack(spacing: 10) {
-                Image(systemName: "point.topleft.down.curvedto.point.bottomright.up")
+                Image(systemName: "map.fill")
                     .font(.system(size: 34))
                     .foregroundColor(UI.dim)
                 Text("本机还没有轨迹")
                     .font(.system(size: 14))
                     .foregroundColor(UI.text)
-                Text("历史轨迹一直是「本机记录」：只有 App 正在跑、并且查到了车的位置，才记一个点。App 没开着的那段一条都没有 —— 所以刚装上新版点进来常常是空的。\n原版不一样，它是直接向车机服务端按天要的。")
+                Text("进来会自动向车机服务端要最近 30 天（901011），补到就按天列出来。\n本机自己记的那些点只有 App 正在跑时才有，服务端那份才是完整的。")
                     .font(.system(size: 12))
                     .foregroundColor(UI.dim)
                     .multilineTextAlignment(.center)
@@ -10376,9 +11447,14 @@ struct HistoryPage: View {
 
     private var durText: String {
         guard let d = cur else { return "--" }
-        // 从服务端补回来的点没有时间戳（startAt/endAt 都是 0），算不出时长
-        if d.startAt <= 0 || d.endAt <= d.startAt { return "--" }
-        let sec = (d.endAt - d.startAt) / 1000
+        // 1.42：服务端 `u` 字段就是时间戳，补回来的天数也算得出来。
+        // 优先用「行驶时长」（只算在动的那几段），停车时间不计；
+        // 老数据没有这个值就退回首末时间差。
+        var sec = d.movingSec
+        if sec <= 0 {
+            guard d.startAt > 0, d.endAt > d.startAt else { return "--" }
+            sec = (d.endAt - d.startAt) / 1000
+        }
         return String(sec / 60) + "分" + String(sec % 60) + "秒"
     }
 
@@ -10444,29 +11520,79 @@ struct HistoryPage: View {
         e.log("▶ 历史轨迹 " + d.key + " 共 " + String(raw.count) + " 点")
     }
 
-    /// 逆地理。原版这两行是「省市区街道 + 门牌 + [POI 名 距离]」，
-    /// 距离那一截得靠服务端的 POI 库，这里用系统的 CLGeocoder 拿到能拿的部分。
+    /// 逆地理。原版这两行是「省市区街道 + 门牌 + [POI 名 距离]」。
+    ///
+    /// 1.43：地址照旧用 CLGeocoder 反查，后面那截 `[金明花园小区 75M]`
+    /// 改用 MapKit 的 POI 检索（MKLocalPointsOfInterestRequest，iOS 14 起就有）
+    /// 在 200 米内取最近的一个地标 + 直线距离，格式和原版对齐。
+    /// 找不到地标就只显示地址，不编。
     private func askPlace(_ dayKey: String, _ tag: Int, _ lat: Double, _ lng: Double) {
         let key = dayKey + "-" + String(tag)
         if places[key] != nil { return }
         if lat == 0 || lng == 0 { return }
+        let coord = CLLocationCoordinate2D(latitude: lat, longitude: lng)
         let loc = CLLocation(latitude: lat, longitude: lng)
+
         CLGeocoder().reverseGeocodeLocation(loc) { marks, _ in
-            guard let m = marks?.first else { return }
             var s = ""
-            let parts: [String?] = [m.administrativeArea, m.locality,
-                                    m.subLocality, m.thoroughfare, m.subThoroughfare]
-            for p in parts {
-                if let x = p, !x.isEmpty { s += x }
+            if let m = marks?.first {
+                let parts: [String?] = [m.administrativeArea, m.locality,
+                                        m.subLocality, m.thoroughfare, m.subThoroughfare]
+                for p in parts {
+                    if let x = p, !x.isEmpty { s += x }
+                }
             }
-            if let n = m.name, !n.isEmpty, s.range(of: n) == nil {
-                s += "[" + n + "]"
-            }
-            if s.isEmpty { return }
-            DispatchQueue.main.async {
-                self.places[key] = s
+            // 地址到手后再补地标距离 —— 两个异步串起来，最后一次性写进 places
+            self.nearestPOI(coord) { name, meters in
+                var out = s
+                if let n = name, let d = meters {
+                    // 地址里已经带了同名地标就不重复加
+                    if out.range(of: n) == nil {
+                        out += "[" + n + " " + Self.distText(d) + "]"
+                    }
+                }
+                if out.isEmpty { return }
+                DispatchQueue.main.async {
+                    self.places[key] = out
+                }
             }
         }
+    }
+
+    /// 半径 200 米内最近的地标。取不到就回 (nil, nil)。
+    private func nearestPOI(_ c: CLLocationCoordinate2D,
+                            done: @escaping (String?, Double?) -> Void) {
+        let req = MKLocalPointsOfInterestRequest(center: c, radius: 200)
+        MKLocalSearch(request: req).start { resp, _ in
+            guard let items = resp?.mapItems, !items.isEmpty else {
+                done(nil, nil)
+                return
+            }
+            let here = CLLocation(latitude: c.latitude, longitude: c.longitude)
+            var bestName: String? = nil
+            var bestDist: Double = .greatestFiniteMagnitude
+            for it in items {
+                guard let n = it.name, !n.isEmpty else { continue }
+                let d = here.distance(from: it.placemark.location ?? here)
+                if d < bestDist {
+                    bestDist = d
+                    bestName = n
+                }
+            }
+            if bestName == nil {
+                done(nil, nil)
+            } else {
+                done(bestName, bestDist)
+            }
+        }
+    }
+
+    /// 距离文案：<1 公里用 M，≥1 公里用 KM —— 和原版那截一致。
+    private static func distText(_ m: Double) -> String {
+        if m >= 1000 {
+            return String(format: "%.1fKM", m / 1000.0)
+        }
+        return String(Int(m.rounded())) + "M"
     }
 
     // MARK: 回放
@@ -10503,10 +11629,12 @@ struct HistoryPage: View {
 
 /// 原版这一页就三行开关加两个按钮。三个开关对应的车机字段在安卓包里能查到
 /// （config.devcfg.privacy、parseVstStatus 里的 gps_opn / gps_cls），但写入走哪条
-/// 指令码没找到实证 —— iOS 包的主二进制是加密的，读不出来。所以这一版：
-///   · 开关的状态记在本机，下次进来还在；
-///   · 「查询」真去问一次车机（203100），把结果回显；
-///   · 「保存」如实告诉用户：这一版还没接车机的写入通道。
+/// 指令码没找到实证 —— 原版这一页的动作是**服务端下发的界面配置**驱动的
+/// （`_vcfg.node("save")` → `steps`），码在服务端，包里和协议里都没有。
+/// 所以这一版：
+///   · 「电子围栏」这一行是真生效的：它管着 App 每 60 秒那一轮越界判定；
+///   · 「GPS开关」「隐私模式」记在本机，保存时如实告诉用户没写进车机；
+///   · 「查询」真去问一次车机（203100），把结果回显。
 /// 宁可少发，也不能瞎发一条配置指令把车机参数改坏。
 struct GpsSetPage: View {
 
@@ -10515,7 +11643,10 @@ struct GpsSetPage: View {
     var onBack: () -> Void
 
     @State private var gpsOn = Store.shared.flag("dev_gps_on", true)
-    @State private var fenceOn = Store.shared.flag("dev_fence_on", true)
+    // 1.43 订正：这里以前存的是 "dev_fence_on"，而引擎读的是 StoreKey.fenceOn
+    // （"fence_on"）—— 两个键名不同，所以这个开关之前存了也**从来没生效过**。
+    // 现在统一走 Store.shared.fenceOn，保存即生效。
+    @State private var fenceOn = Store.shared.fenceOn
     @State private var privacy = Store.shared.flag("dev_privacy", false)
     @State private var hint = ""
     @State private var busy = false
@@ -10603,10 +11734,24 @@ struct GpsSetPage: View {
 
     private func save() {
         Store.shared.putFlag("dev_gps_on", gpsOn)
-        Store.shared.putFlag("dev_fence_on", fenceOn)
         Store.shared.putFlag("dev_privacy", privacy)
-        hint = "开关已记在手机上。这三项属于车机固件设置，写入指令还没接通 —— "
-            + "原版走的是车机协议，码在加密的 iOS 包里读不出来，硬发可能把车机参数改坏。"
+        // 电子围栏这一行是**真的有用**的：它管着 App 每 60 秒那一轮越界判定。
+        Store.shared.fenceOn = fenceOn
+        e.fenceEnabled = fenceOn
+
+        var lines: [String] = []
+        lines.append("电子围栏：" + (fenceOn ? "已生效（App 在前台时每 60 秒判一次）"
+                                             : "已关闭，不再判越界"))
+        if gpsOn {
+            lines.append("GPS 开关：记在本机（开），没能写进车机")
+        } else {
+            lines.append("GPS 开关：记在本机（关），没能写进车机")
+        }
+        lines.append("隐私模式：同上，只能本机记录")
+        lines.append("这两项属于车机固件参数（config.devcfg.privacy 一类），"
+                     + "原版的写入指令在服务端下发的界面配置里，包里读不出来；"
+                     + "硬发可能改坏车机参数，所以没发。")
+        hint = lines.joined(separator: "\n")
         e.log("▶ GPS功能设置：保存 GPS=" + String(gpsOn)
               + " 围栏=" + String(fenceOn) + " 隐私=" + String(privacy))
     }
