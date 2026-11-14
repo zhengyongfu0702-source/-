@@ -2493,15 +2493,41 @@ final class CarAPI {
     static let CLI_KEY = "android-070466c235ec281d"
 
     static let CODE_LOGIN = "10001003"
+
+    /// 203100 = 查设备状态。
+    /// 取证：原版 `SendAction.queryDevStForce()` 里
+    /// `callAction("actions.device.203100", -1, "")`，无参数、立即发。
     static let CODE_STATUS = "203100"
-    /// 1.32：让车机立刻上报一次。原版「更新状态」，无参数。
-    /// 和 203100 的区别：203100 读的是平台缓存，这条是叫醒车机现报。
-    static let CODE_REPORT_NOW = "303505"
+
+    /// 203101 = 普通查设备状态（读平台缓存）。
+    /// 取证：原版 `SendAction.queryDevSt()` 里
+    /// `callAction("actions.device.203101", -1, "")`。
+    static let CODE_STATUS_CACHE = "203101"
+
+    /// 303598 = 让车机**现在上报一次**。
+    ///
+    /// 取证：原版 `TrackFlowController$MyOnDelay.onTimer()` 里
+    /// `callAction("actions.device.303598", 60000, "")`
+    /// ＋ `callAction("actions.device.203100", 1900, "")`。
+    /// 即「每 60 秒叫车机报一次，1.9 秒后读结果」—— 这就是原版实时追踪。
+    ///
+    /// 1.41 订正：这里以前是 `303505`，那个码在原版 1.0.6 的包里
+    /// **一次都没出现**（145 MB 反编译文本 grep 计数 0），是早期猜的。
+    /// 服务端收到未知 txncode 只会丢掉，所以「点了刷新、车机没反应」是必然的。
+    static let CODE_REPORT_NOW = "303598"
     static let CODE_LOCK = "303110"
     static let CODE_UNLOCK = "303115"
     /// 一键启动 / 熄火。实车抓包得来：303120 = 启动，303125 = 熄火
     static let CODE_START = "303120"
     static let CODE_STOP = "303125"
+
+    /// 1.40：历史轨迹（只读）。
+    /// 从原版安卓 `HistoryController.onQueryHis(JJ)` 反编译得来：
+    /// 请求体是 tid + bgdt/eddt/bgsdt/edsdt 四个**秒**数，
+    /// eddt = bgdt + 86400（正好一天），bgsdt/edsdt 与 bgdt/eddt 同值。
+    /// 响应在 body.rows 里，每个点纬度在 `t`、经度在 `g`。
+    /// 这条只查不写，发错了也不会动车。
+    static let CODE_HISTORY = "901011"
 
     var uid = ""
     var ssk = ""
@@ -2669,7 +2695,8 @@ final class CarAPI {
 
     func lock() throws -> Resp { return try send(CarAPI.CODE_LOCK) }
     func unlock() throws -> Resp { return try send(CarAPI.CODE_UNLOCK) }
-    /// 让车机立刻上报。失败不抛给界面 —— 手动刷新本来就是「尽力而为」。
+    /// 叫车机立刻现报一次（= 303598，原版实时追踪每 60 秒发的那条）。
+    /// 原版这条不带 body，设备号走 app_head.tid，所以这里也不塞参数。
     func reportNow() throws -> Resp { return try send(CarAPI.CODE_REPORT_NOW) }
     /// 一键启动（远程着车）。走网络，不需要蓝牙在附近。
     func startEngine() throws -> Resp { return try send(CarAPI.CODE_START) }
@@ -2696,6 +2723,69 @@ final class CarAPI {
         } catch {
             return nil
         }
+    }
+
+    // MARK: 历史轨迹（只读）
+
+    /// 取某一天的轨迹点。`dayStartSec` 是那天 0 点的 unix 秒。
+    ///
+    /// 只读查询：服务端不会因为这条指令去叫车机，也不会改任何配置。
+    /// 响应里每个点的键是 `t`（纬度）/ `g`（经度），个别版本用 lat/lng，
+    /// 两个都认。点没有时间戳，所以调用方拿到的只是几何。
+    func historyPath(dayStartSec: Int64) throws -> [(Double, Double)] {
+        let bg = String(dayStartSec)
+        let ed = String(dayStartSec + 86400)
+        let body = JB.o([
+            ("tid", .s(tid)),
+            ("bgdt", .s(bg)),
+            ("eddt", .s(ed)),
+            ("bgsdt", .s(bg)),
+            ("edsdt", .s(ed))
+        ])
+        let r = try send(CarAPI.CODE_HISTORY, bodyJson: body)
+        // 抛出来让调用方把 ret_code/ret_msg 记进运行日志 —— 服务端不认这条指令时，
+        // 界面上只会看到「没有轨迹」，那就没法判断到底是没数据还是被拒了。
+        if !r.ok {
+            throw IllegalState("历史查询被拒 " + r.code + " " + r.msg)
+        }
+        guard let b = r.json?["body"] as? [String: Any] else { return [] }
+
+        var rows: [[String: Any]] = []
+        if let arr = b["rows"] as? [[String: Any]] {
+            rows = arr
+        } else if let dict = b["rows"] as? [String: Any] {
+            // 有的接口把行按下标做键，按字符串排序拿回来
+            for k in dict.keys.sorted() {
+                if let o = dict[k] as? [String: Any] { rows.append(o) }
+            }
+        } else if let arr = b["rows"] as? [Any] {
+            for o in arr {
+                if let d = o as? [String: Any] { rows.append(d) }
+            }
+        }
+
+        var out: [(Double, Double)] = []
+        out.reserveCapacity(rows.count)
+        for row in rows {
+            // t/g 是原版用的键；lat/lng 是兜底，防止服务端换了字段名
+            let la = CarAPI.num(row["t"]) ?? CarAPI.num(row["lat"])
+            let ln = CarAPI.num(row["g"]) ?? CarAPI.num(row["lng"])
+            guard let a = la, let o = ln else { continue }
+            // 0,0 是没定位，画上去会是一条从非洲拉过来的线
+            if a == 0 || o == 0 { continue }
+            if abs(a) > 90 || abs(o) > 180 { continue }
+            out.append((a, o))
+        }
+        return out
+    }
+
+    /// JSON 里的数字可能是 Double / Int / 字符串三种，统一取出来。
+    static func num(_ any: Any?) -> Double? {
+        if let d = any as? Double { return d }
+        if let i = any as? Int { return Double(i) }
+        if let n = any as? NSNumber { return n.doubleValue }
+        if let s = any as? String { return Double(s) }
+        return nil
     }
 
     static func parseCar(_ o: [String: Any], _ fetchedAt: Int64) -> Car {
@@ -3949,7 +4039,7 @@ final class AutoEngine: NSObject, ObservableObject {
     /// 参与了编译，界面上才会跟着变。
     ///
     /// 每次改源码就换一个值，装完瞄一眼底部就知道装的是哪一次构建。
-    static let buildTag = "b1110f"
+    static let buildTag = "b1110h"
 
     let ble = BleCentral()
     let api = CarAPI()
@@ -4282,7 +4372,7 @@ final class AutoEngine: NSObject, ObservableObject {
         }
     }
 
-    private func ensureSession(_ done: @escaping (Bool) -> Void) {
+    private func ensureSession(_ done: @escaping (Bool) -> Void, retry: Int = 0) {
         if api.hasSession {
             done(true)
             return
@@ -4293,7 +4383,16 @@ final class AutoEngine: NSObject, ObservableObject {
             done(false)
             return
         }
-        if loginInFlight { return }
+        if loginInFlight {
+            // 1.41：以前这里是直接 return，把 done 丢掉 —— 正赶上自动重登时点刷新，
+            // 界面就永远等不到回调，看着像「点了没反应」。改成排队等它回来，
+            // 最多等 6 次（约 4.8 秒），超时才判失败。
+            guard retry < 6 else { done(false); return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                self.ensureSession(done, retry: retry + 1)
+            }
+            return
+        }
         loginInFlight = true
         let epoch = sessionEpoch
         DispatchQueue.global(qos: .userInitiated).async {
@@ -5938,29 +6037,122 @@ final class AutoEngine: NSObject, ObservableObject {
 
     // MARK: 手动刷新 / 地点名称（1.32）
 
-    /// 手动刷新。先叫车机现在报一次（303505），2.5 秒后再读 203100。
+    /// 手动刷新车辆状态。
     ///
-    /// 只读 203100 拿到的是平台缓存，可能停在几分钟前 —— 用户点了刷新却看到旧数据，
-    /// 会以为车没动。所以先点名、后读值。303505 失败也不影响，照读缓存。
+    /// 1.41 订正：以前这里发的是 `303505`，那个码在原版 1.0.6 的包里
+    /// **一次都没出现**（145 MB 反编译文本 grep 计数 0），是早期猜的。
+    /// 服务端收到未知 txncode 只会丢掉，所以「点了刷新、车机没反应」是必然结果。
+    ///
+    /// 原版的做法在 `TrackFlowController$MyOnDelay.onTimer()` 里：
+    /// `callAction("actions.device.303598", 60000, "")`
+    /// ＋ `callAction("actions.device.203100", 1900, "")`。
+    /// 也就是：先发 **303598** 让车机现在报一次，再查 **203100** 拿结果。
+    /// 这里照它做，并把「发了什么 / 服务端怎么回 / 最后读到没读到」全记日志。
     func manualRefresh() {
-        log("▶ 手动刷新车辆状态（先叫车机上报）")
+        // 下发前这条记录的时间戳，用来判断「后来读到的是不是新的」
+        let before = car?.reportedAt ?? 0
+        log("▶ 手动刷新：下发 303598（原版让车机现报的那条），随后轮询 203100")
         ensureSession { ok in
             guard ok else {
-                self.log("⚠ 无有效会话，只读缓存")
-                self.refreshStatus()
+                self.log("⚠ 没有有效会话，指令没发出去；只读一次缓存")
+                self.refreshStatus { c in
+                    self.log(c == nil ? "✗ 缓存也读不到" : "· 读到的是缓存，不是实时上报")
+                }
                 return
             }
             DispatchQueue.global(qos: .userInitiated).async {
-                _ = try? self.api.reportNow()
-                DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
-                    self.refreshStatus()
+                do {
+                    let r = try self.api.reportNow()
+                    if r.ok {
+                        self.log("· 303598 已受理（" + (r.code.isEmpty ? "S" : r.code) + "）")
+                    } else {
+                        self.log("✗ 303598 被拒 " + r.code + " " + r.msg + "（仍会去读一次缓存）")
+                    }
+                } catch {
+                    self.log("✗ 303598 没发出去：" + error.localizedDescription)
+                }
+                DispatchQueue.main.async {
+                    self.pollFresh(before: before, left: 6, spent: 0)
                 }
             }
         }
     }
 
-    /// 经纬度 → 地名（高德逆地理编码）。
+    /// 等车机把新数据报上来。
     ///
+    /// 303598 只是「通知车机去报」，车机走 2G/4G 回来要几秒到十几秒，
+    /// 这一刻平台里还是旧数据。以前只等 2.5 秒读一次，多半读到的还是旧的，
+    /// 看着就像「指令没生效」。原版是 1.9 秒后读一次、同时靠 202110 推送补；
+    /// 我们没有长连接，所以改成每 2 秒读一次、最多 6 次（12 秒），
+    /// 读到时间戳比 `before` 新就收工。
+    private func pollFresh(before: Int64, left: Int, spent: Int) {
+        refreshStatus { c in
+            if let c = c {
+                let ts = c.reportedAt > 0 ? c.reportedAt : c.fetchedAt
+                if before <= 0 || ts > before {
+                    let when = CarAPI.fmt("HH:mm:ss", Date(timeIntervalSince1970: Double(ts) / 1000))
+                    self.log("✓ 状态已刷新（等了 " + String(spent) + " 秒），车机上报时间 " + when)
+                    return
+                }
+            }
+            guard left > 1 else {
+                self.log("✗ 等了 12 秒车机还没报新数据（可能休眠、信号差，或本来就停在原地没上报）")
+                return
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                self.pollFresh(before: before, left: left - 1, spent: spent + 2)
+            }
+        }
+    }
+
+    // MARK: 历史轨迹补录（1.40）
+
+    /// 从车机把最近 N 天的轨迹补进本机。
+    ///
+    /// 只读：走 901011（原版 `HistoryController.onQueryHis`），不会叫醒车机、
+    /// 也不会改任何配置。拿到点就存进本地轨迹库，历史页照常按天显示。
+    ///
+    /// 为什么要「按天问」而不是像原版那样一次拿一个月：原版那个按天列表用的
+    /// 指令码是从服务器下发的配置里读的（键名 `dayqry`），包里没有写死，
+    /// 所以这里退一步，按天问、按天存。等哪天抓到那个码，换成一次拿一个月即可。
+    ///
+    /// `done(got)`：got 是补到天数的条数；-1 表示没有有效会话。
+    func syncHistory(days: Int, done: @escaping (Int) -> Void) {
+        let n = max(1, min(31, days))
+        ensureSession { ok in
+            guard ok else {
+                self.log("⚠ 历史轨迹：没有有效会话，补不了")
+                done(-1)
+                return
+            }
+            DispatchQueue.global(qos: .userInitiated).async {
+                var got = 0
+                let cal = Calendar.current
+                let today = cal.startOfDay(for: Date())
+                for i in 0..<n {
+                    guard let d = cal.date(byAdding: .day, value: -i, to: today) else { continue }
+                    let sec = Int64(d.timeIntervalSince1970)
+                    let key = TrackStore.key(d)
+                    do {
+                        let pts = try self.api.historyPath(dayStartSec: sec)
+                        if pts.count >= 2 {
+                            TrackStore.shared.merge(day: key, pts: pts)
+                            got += 1
+                            self.log("· 历史 " + key + "：" + String(pts.count) + " 点")
+                        } else {
+                            self.log("· 历史 " + key + "：服务端没有点")
+                        }
+                    } catch {
+                        let m = (error as? LocalizedError)?.errorDescription ?? "\(error)"
+                        self.log("✗ 历史 " + key + "：" + m)
+                    }
+                }
+                DispatchQueue.main.async { done(got) }
+            }
+        }
+    }
+
+    /// 经纬度 → 地名（高德逆地理编码）。
     /// 三条约束：没有 key 不请求；同一点位 5 分钟内不重复请求；失败保持上一次的名字，
     /// 不要把界面清空 —— 用户看到"定位中"闪来闪去比看到一个稍旧的地名更烦。
     private func resolvePlace(_ c: CarAPI.Car) {
@@ -7234,7 +7426,8 @@ struct MainView: View {
                 GhostButton(title: "刷新车辆状态",
                             color: UI.accent,
                             enabled: true) {
-                    // 1.32：先叫车机上报（303505），2.5 秒后再读，不然看到的是缓存
+                    // 1.41：203100 就是原版「强制查设备状态」（queryDevStForce），
+                    // 发完车机异步上报，引擎会每 2 秒读一次、最多等 12 秒
                     e.manualRefresh()
                 }
             }
@@ -7897,6 +8090,15 @@ struct CarMapView: UIViewRepresentable {
 //    先列出**每一天**一条（日期、里程 miles、平均速度 avgspd、最高速度 maxspd、
 //    起止时间），点某天进回放页：进度条 slider + 前进 forward / 后退 backward +
 //    播放 his.start / 停止 his.stop，每个点显示速度（KM/H），还能切卫星图和路况。
+//    1.40：数据来自**服务端**，不是手机本地。取证结果 ——
+//      · `HistoryController.onQueryHis(JJ)` 发 `901011`，body 里
+//        tid + bgdt/eddt/bgsdt/edsdt 四个**秒**数，eddt = bgdt + 86400；
+//        响应 body.rows 里纬度是 `t`、经度是 `g`（`UtilsMapPath.setPath` 读的就是这两个）。
+//      · 按天列表那条指令码是从服务器下发的 widget 配置里取的（键名 `dayqry`，
+//        iOS 二进制里能看到 widget.map.historyListView 那一串键），包里没写死，
+//        所以这一版改成「按天问 901011、按天存本地」，界面照旧按天列。
+//      · 顺带修：1.39 删旧 sheet 时把地图上的轨迹线弄成了死代码（只剩 track = []），
+//        现在每次刷到新位置都重读本地轨迹库。
 //  · 导航到车 = ActionMapNavi：探测装了哪个地图——高德 com.autonavi.minimap、
 //    百度 com.baidu.BaiduMap、腾讯 com.tencent.map，用 URI 直接唤起并进驾车路线；
 //    一个都没装就开网页版。目的地取 lloc.lat / lloc.lng。
@@ -8014,6 +8216,32 @@ final class TrackStore {
     /// 一天的原始点（WGS-84，未换算）。
     func points(day key: String) -> [Pt] {
         return loadPts(fileURL(key))
+    }
+
+    /// yyyyMMdd，和文件名一致。给「从车机补历史」用。
+    static func key(_ date: Date) -> String {
+        let f = DateFormatter()
+        f.dateFormat = "yyyyMMdd"
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = TimeZone.current
+        return f.string(from: date)
+    }
+
+    /// 把服务端取回来的一天补进本地。
+    ///
+    /// 服务端只给坐标、不给时间戳，所以这些点的 ts 记 0 —— 时长和均速会显示
+    /// 「--」，里程和轨迹线照常。本地这一天已经有两个以上点就不动它：
+    /// 本地是 App 实时记的，比事后补的可信。
+    func merge(day key: String, pts coords: [(Double, Double)]) {
+        guard coords.count >= 2 else { return }
+        let url = fileURL(key)
+        if loadPts(url).count >= 2 { return }
+        var out: [Pt] = []
+        out.reserveCapacity(coords.count)
+        for c in coords {
+            out.append(Pt(lat: c.0, lng: c.1, ts: 0, kph: 0))
+        }
+        savePts(out, to: url)
     }
 
     /// 最近几天的点，按时间正序（昨天 → 今天），已换成地图坐标。
@@ -8754,6 +8982,7 @@ struct MapPage: View {
             }
             updateDistance()
             checkFences()
+            refreshTrackLine()
         }
         .onDisappear {
             stopTracking()
@@ -8783,9 +9012,17 @@ struct MapPage: View {
                 panelLink("chevron.left", "返回") { isPresented = false }
                 panelLink("location.fill", "我的位置") { jumpToMe() }
                 panelLink("arrow.clockwise", "刷新") {
-                    hint = "已叫车机上报，几秒后回来看看"
+                    hint = "已让车机现报，最多等 12 秒"
                     e.manualRefresh()
                     updateDistance()
+                    // 引擎是每 2 秒读一次、最多 12 秒。轨迹线在两个时间点各补刷一次，
+                    // 车机回得早就 4 秒补上，回得晚就等 13 秒那次。
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) {
+                        self.refreshTrackLine()
+                    }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 13.0) {
+                        self.refreshTrackLine()
+                    }
                 }
                 panelLink("map.fill", satellite ? "卫星" : "标准") {
                     satellite = !satellite
@@ -8965,11 +9202,14 @@ struct MapPage: View {
 
     // MARK: 实时追踪（照原版 TrackFlowController）
 
-    /// 原版是定时器循环：安卓每 60 秒一轮（0xEA60），先叫车机定位、
-    /// 等 1.9 秒再读状态；地图跟着车走，同时算手机到车的距离。
+    /// 原版是定时器循环：每 60 秒一轮，先发 303598 叫车机现报一次，
+    /// 1.9 秒后读 203100 拿结果；地图跟着车走，同时算手机到车的距离。
     ///
-    /// iOS 包的主二进制里没有 303598 这个码（那条是安卓侧的），所以这里
-    /// 用 203100 读状态这一半，不额外发指令 —— 宁可少发，不要乱发。
+    /// 1.41 订正：以前这里只调 refreshStatus()（= 只读 203100），注释还写着
+    /// 「iOS 包没有 303598 这个码」—— 那个判断是错的。指令码是**服务端**的
+    /// txncode，跟客户端是安卓还是 iOS 无关（我们连的就是同一个 www.zxy268.com，
+    /// chnl 也照样报 android）。所以这里改成调 manualRefresh()，和原版一致：
+    /// 先催车机报，再轮询读回。
     private func toggleTracking() {
         if tracking {
             stopTracking()
@@ -8980,16 +9220,17 @@ struct MapPage: View {
         tracking = true
         follow = true
         recenter += 1
-        hint = "实时追踪已开 · 每 60 秒自动刷新一次车辆位置"
-        e.log("▶ 开始实时追踪（60 秒一轮）")
-        e.refreshStatus()
+        hint = "实时追踪已开 · 每 60 秒让车机现报一次"
+        e.log("▶ 开始实时追踪（60 秒一轮，先 303598 再读 203100）")
+        e.manualRefresh()
         trackTimer = Timer.scheduledTimer(withTimeInterval: 60.0, repeats: true) { _ in
             // 闭包里一律显式写 self：SXKC 是 struct，Swift 在 escaping 闭包中
             // 不允许裸引用成员。
             DispatchQueue.main.async {
-                self.e.refreshStatus()
+                self.e.manualRefresh()
                 self.updateDistance()
                 self.checkFences()
+                self.refreshTrackLine()
             }
         }
     }
@@ -9000,6 +9241,15 @@ struct MapPage: View {
             t.invalidate()
             trackTimer = nil
         }
+    }
+
+    /// 地图上那条今天走过的线。
+    ///
+    /// 1.39 把旧的轨迹 sheet 整块删掉时，只留下了 `track = []`，没人再往里填 ——
+    /// 于是地图上什么都没有，看着就像「历史轨迹没显示」。这里补回来：
+    /// 每次查到新位置、开页、手动刷新之后都重读一次本地轨迹库。
+    private func refreshTrackLine() {
+        track = TrackStore.shared.points(daysBack: 0)
     }
 
     private func updateDistance() {
@@ -9803,6 +10053,11 @@ struct HistoryPage: View {
     @State private var sel = 0
     @State private var mapMode = false
 
+    // 1.40：从车机补历史
+    @State private var syncing = false
+    @State private var syncNote = ""
+    @State private var autoTried = false
+
     @State private var raw: [TrackStore.Pt] = []
     @State private var pts: [CLLocationCoordinate2D] = []
     @State private var idx: Double = 0
@@ -9836,7 +10091,15 @@ struct HistoryPage: View {
             }
         }
         .background(UI.bg)
-        .onAppear { load() }
+        .onAppear {
+            load()
+            // 本机没有轨迹就自动向车机要一次（只读）。每次打开只试一回，
+            // 免得连不上时每进一次页面打 7 个请求。
+            if days.isEmpty && !autoTried {
+                autoTried = true
+                syncFromCar()
+            }
+        }
         .onDisappear { stopTimer() }
     }
 
@@ -10014,28 +10277,90 @@ struct HistoryPage: View {
     }
 
     private var footNote: some View {
-        Text("轨迹由本机记录：App 没开的那段录不到。原版是从车机上报的历史里按天拉回来的。")
-            .font(.system(size: 10))
-            .foregroundColor(UI.dim)
-            .fixedSize(horizontal: false, vertical: true)
-            .frame(maxWidth: .infinity, alignment: .leading)
+        VStack(alignment: .leading, spacing: 8) {
+            Text("本机只记得住 App 开着的那段。更早的可以从车机服务端补回来 —— 只查不写，不动车。")
+                .font(.system(size: 10))
+                .foregroundColor(UI.dim)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            syncBtn
+            if !syncNote.isEmpty {
+                Text(syncNote)
+                    .font(.system(size: 10))
+                    .foregroundColor(UI.ok)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+    }
+
+    /// 从车机补最近 7 天。走 901011（只读），不会叫醒车机、也不改配置。
+    private var syncBtn: some View {
+        Button {
+            syncFromCar()
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: syncing ? "arrow.triangle.2.circlepath" : "icloud.and.arrow.down")
+                    .font(.system(size: 12, weight: .semibold))
+                Text(syncing ? "正在取…" : "从车机补最近 7 天")
+                    .font(.system(size: 12, weight: .semibold))
+            }
+            .foregroundColor(UI.accent)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(UI.card)
+            .cornerRadius(9)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(PlainButtonStyle())
+        .disabled(syncing)
+    }
+
+    private func syncFromCar() {
+        guard !syncing else { return }
+        syncing = true
+        syncNote = "正在向车机要最近 7 天…"
+        e.syncHistory(days: 7) { got in
+            // 这里是 escaping 闭包，struct 里必须显式写 self
+            self.syncing = false
+            if got < 0 {
+                self.syncNote = "没有有效会话，回设置里重新登录一次再试"
+            } else if got == 0 {
+                self.syncNote = "车机那边这 7 天没有轨迹。（详情看运行日志里的「历史」几行）"
+            } else {
+                self.syncNote = "补到 " + String(got) + " 天，已按天列出来"
+            }
+            self.load()
+        }
     }
 
     private var emptyView: some View {
-        VStack(spacing: 10) {
-            Image(systemName: "point.topleft.down.curvedto.point.bottomright.up")
-                .font(.system(size: 34))
-                .foregroundColor(UI.dim)
-            Text("还没有轨迹")
-                .font(.system(size: 14))
-                .foregroundColor(UI.text)
-            Text("开出去转一圈，App 每次刷到车的位置就会记一个点。")
-                .font(.system(size: 12))
-                .foregroundColor(UI.dim)
-                .multilineTextAlignment(.center)
+        ScrollView {
+            VStack(spacing: 10) {
+                Image(systemName: "point.topleft.down.curvedto.point.bottomright.up")
+                    .font(.system(size: 34))
+                    .foregroundColor(UI.dim)
+                Text("本机还没有轨迹")
+                    .font(.system(size: 14))
+                    .foregroundColor(UI.text)
+                Text("历史轨迹一直是「本机记录」：只有 App 正在跑、并且查到了车的位置，才记一个点。App 没开着的那段一条都没有 —— 所以刚装上新版点进来常常是空的。\n原版不一样，它是直接向车机服务端按天要的。")
+                    .font(.system(size: 12))
+                    .foregroundColor(UI.dim)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+                syncBtn
+                    .padding(.top, 2)
+                if !syncNote.isEmpty {
+                    Text(syncNote)
+                        .font(.system(size: 11))
+                        .foregroundColor(UI.ok)
+                        .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .padding(30)
+            .frame(maxWidth: .infinity)
         }
-        .padding(30)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     // MARK: 数据
@@ -10050,17 +10375,21 @@ struct HistoryPage: View {
     }
 
     private var durText: String {
-        guard let d = cur else { return "0分0秒" }
-        let sec = max(0, (d.endAt - d.startAt) / 1000)
+        guard let d = cur else { return "--" }
+        // 从服务端补回来的点没有时间戳（startAt/endAt 都是 0），算不出时长
+        if d.startAt <= 0 || d.endAt <= d.startAt { return "--" }
+        let sec = (d.endAt - d.startAt) / 1000
         return String(sec / 60) + "分" + String(sec % 60) + "秒"
     }
 
     private var avgText: String {
-        return String(format: "%.1fKM/H", cur?.avgKph ?? 0)
+        guard let d = cur, d.avgKph > 0.05 else { return "--" }
+        return String(format: "%.1fKM/H", d.avgKph)
     }
 
     private var maxText: String {
-        return String(format: "%.0fKM/H", cur?.maxKph ?? 0)
+        guard let d = cur, d.maxKph > 0.5 else { return "--" }
+        return String(format: "%.0fKM/H", d.maxKph)
     }
 
     private var curIdx: Int {
