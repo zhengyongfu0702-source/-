@@ -878,7 +878,7 @@ enum Logic {
         /// 1.26 新增。这个时间决定「车自己上锁后，人还在车旁多久才允许再开」：
         /// 原来一律要「走开 30 秒再回来」，于是下车关门、车一自锁，人就再也
         /// 拉不开门了 —— 用户说的罚站，很多是这一条。自锁回环只发生在几秒内，
-        /// 用 20 秒的持续在旁作确认，既挡住回环又不会把人关在门外。
+        /// 用几秒的持续在旁作确认，既挡住回环又不会把人关在门外（1.51 起 3 秒）。
         var flipAt: Int64 = 0
         /// 连续多少拍判定为「已离开」，用于抗丢包
         var awayTicks = 0
@@ -894,7 +894,7 @@ enum Logic {
         ///
         /// 冷却本来是为了挡住「门在 10 米线上抖 → 开了又锁、锁了又开」。
         /// 但真正挡住这个的是 `unlockedThisVisit`：一次到访只开一次，要等走开
-        /// 30 秒或车自锁后 20 秒才重置。冷却叠在上面只剩一个副作用 ——
+        /// 30 秒或车自锁后 3 秒才重置。冷却叠在上面只剩一个副作用 ——
         /// 刚锁完车转身要拿东西，60 秒内怎么都不给开。所以取消。
         var unlockCooldownMs: Int64 = 0
         var lockCooldownMs: Int64 = 60000
@@ -955,10 +955,11 @@ enum Logic {
         //
         // 现场：下车关门，车辆自动上锁（未锁→已锁），人转身想在副驾拿包。
         // 1.25 及以前这里要把「走开 30 秒」当解除条件，于是门怎么拉都不开。
-        // 20 秒是权衡：自锁回环在 1~3 秒内就会暴露，20 秒足够挡住；
-        // 而真心想上车的人不会在车边干站 20 秒还不碰门。
+        // 1.26 改成「在车旁持续 20 秒」，挡住回环但还是要干站 20 秒。
+        // 1.51 压到 3 秒：自锁回环 1~3 秒内就暴露，3 秒足够挡；而人要拿包，
+        // 3 秒后拉门就该开。常数见 `UNLOCK_SUPPRESS_MS`。
         if s.armed && s.unlockedThisVisit && near && s.flipAt > 0
-            && (s.now - s.flipAt) > 20000 {
+            && (s.now - s.flipAt) > UNLOCK_SUPPRESS_MS {
             s.unlockedThisVisit = false
         }
 
@@ -1185,6 +1186,15 @@ enum Logic {
     /// 贴在车门边时几乎不可能低于 -85 —— 那是穿两层混凝土的量级。
     static let CONNECT_MIN_RSSI = -85
 
+    /// 车自己上锁之后，人还站在车旁要等多久才允许再开锁（毫秒）。
+    ///
+    /// 1.51：20 秒 → 3 秒。
+    ///
+    /// 这个等待只为挡住「自锁 → 又开 → 又锁」的回弹，而回弹只在 1~3 秒内发生；
+    /// 20 秒挡住回弹的同时也把人挡在门外 —— 下车关门、车自锁、你转身想拿副驾的包，
+    /// 拉门不动，得干站 20 秒。现场反馈里「罚站」很大一部分就是这 20 秒。
+    static let UNLOCK_SUPPRESS_MS: Int64 = 3000
+
     /// 蓝牙信号是否「实质可用」：连着、有读数、且明显强于开锁门限。
     ///
     /// - Parameter unlockThr: 用户设的开锁信号门限（默认 -72），这里再留
@@ -1286,6 +1296,17 @@ enum Logic {
     /// 双通道并发之后，最多再重发几轮。每轮间隔 `VERIFY_WINDOW_MS`。
     /// 4 轮 ≈ 80 秒，足够覆盖地库、弱网、车机刚唤醒这几种慢响应。
     static let VERIFY_MAX_ROUNDS = 4
+
+    /// **自动**锁车最多再补发几轮（1.50）。
+    ///
+    /// 手动锁车 4 轮是对的：人站在车边拉门把手，第一条被丢就该补。
+    /// 但自动锁车不一样 —— 下发时人已经在走开，车机停车熄火后本来就是
+    /// 每 183 秒才上报一次，20 秒等不到状态帧是**常态，不是故障**。
+    /// 按 4 轮跑就是 5 条锁车指令 + 100 秒的查询风暴，用户看到的是「它一直在锁」，
+    /// 而那些迟到的指令还可能落在人折返回车边之后，造成罚站。
+    ///
+    /// 所以自动锁车只补 1 次（合计最多 2 条指令），仍不确认就如实报「请手动核对」。
+    static let AUTO_LOCK_MAX_ROUNDS = 1
 
     // MARK: 回执后的二次核实
 
@@ -1908,10 +1929,19 @@ final class Store {
 
     // MARK: - 定位
 
-    /// 定位判距总开关。默认**开**：这一版的重点就是它，装完不用去设置里翻。
+    /// 定位判距总开关 —— **1.50 起恒为关**。
+    ///
+    /// 「走远锁车（GPS 100 米）」这个功能已经删除：实测它带来的麻烦远大于收益 ——
+    /// 城区的 GPS 漂移会把「在车边」算成「走远了」，而车机停车后 183 秒才上报一次，
+    /// 拿不到新鲜锁态就反复重发，于是变成「一直在锁」。
+    ///
+    /// 现在离开判定只有一条：**蓝牙断开 + 离开够久（`awaySeconds`，默认 30 秒）**。
+    /// 蓝牙断开本身就是「人走了」最直接的证据，不飘、不耗电、不吃后台定位权限。
+    ///
+    /// 键还留着只为兼容旧存档：读永远返回 false，写进去也没有任何代码会消费它。
     var geoOn: Bool {
-        get { return flag(StoreKey.geoOn, true) }
-        set { putFlag(StoreKey.geoOn, newValue) }
+        get { return false }
+        set { putFlag(StoreKey.geoOn, false) }
     }
 
     /// 后台持续定位。默认**关**：先按省电跑，用户需要锁屏也生效时自己打开。
@@ -2043,6 +2073,8 @@ final class Store {
 //  经纬度，灌原始 GPS 坐标等于问了一个偏 500 米的路口，地名会「大致对、细看不对」。
 //
 
+import Foundation
+import CoreLocation
 
 enum MapGeo {
 
@@ -4509,7 +4541,7 @@ final class AutoEngine: NSObject, ObservableObject {
     /// 参与了编译，界面上才会跟着变。
     ///
     /// 每次改源码就换一个值，装完瞄一眼底部就知道装的是哪一次构建。
-    static let buildTag = "b1110p"
+    static let buildTag = "b1116a"
 
     let ble = BleCentral()
     let api = CarAPI()
@@ -4563,8 +4595,8 @@ final class AutoEngine: NSObject, ObservableObject {
     @Published var geoActive = false
     /// 后台定位开关，界面直接绑定
     @Published var locBackground = false
-    /// 定位判距总开关（界面绑定）
-    @Published var geoEnabled = false
+
+    // 1.50：`geoEnabled`（走远锁车开关）已删除 —— 见 `Store.geoOn`。
 
     // MARK: 双通道竞速 / 洗车模式 / 统计（1.16）
 
@@ -4782,7 +4814,6 @@ final class AutoEngine: NSObject, ObservableObject {
             s.evaluate("围栏变化")
         }
         locBackground = store.locBg
-        geoEnabled = store.geoOn
         raceEnabled = store.raceOn
         connectUnlockEnabled = store.connectUnlock
         doorGuardEnabled = store.flag(StoreKey.doorGuard, true)
@@ -5172,12 +5203,15 @@ final class AutoEngine: NSObject, ObservableObject {
         }
         if !armedKnown { whyText = "还没收到车锁状态"; return }
 
-        let farM = Int(Logic.farLockM(store.geoFarM))
-
         // ── 蓝牙有信号：主路径，正常状态不必解释 ──
         if ble.isConnected {
             if st.unlockedThisVisit && armed {
-                whyText = "车辆刚自己上锁 · 在车旁持续 20 秒或走开再回来才会自动开"
+                // flipAt > 0 是「车辆自己锁上的」；否则是你在车边用手机锁的
+                if st.flipAt > 0 {
+                    whyText = "车辆刚自己上锁 · 3 秒后拉门就会自动开"
+                } else {
+                    whyText = "本次到访刚锁过车 · 走开再回来才会自动开"
+                }
                 return
             }
             if isNearNow() {
@@ -5195,24 +5229,14 @@ final class AutoEngine: NSObject, ObservableObject {
                 if r > -120 && r < store.cfg.thr {
                     whyText = "信号 \(r)dBm 未达门限 \(store.cfg.thr)dBm · 再靠近一点，或等重连即开"
                 } else {
-                    whyText = "蓝牙已连接 · 走远到 \(farM) 米外才会自动锁"
+                    whyText = "蓝牙已连接 · 走开后断开 \(store.cfg.awayMs / 1000) 秒自动锁"
                 }
             }
             return
         }
 
-        // ── 蓝牙没信号：看定位怎么说 ──
-        if geoActive, !geoSt.dist.isNaN {
-            let d = geoSt.dist
-            whyText = d >= Logic.farLockM(store.geoFarM)
-                ? "距车 \(Int(d.rounded())) 米 · 正在锁车…"
-                : "距车 \(Int(d.rounded())) 米 · 还没到 \(farM) 米，不锁"
-            return
-        }
-        if !store.geoOn {
-            whyText = "蓝牙已断 · 定位兜底已关，断联 \(store.cfg.awayMs / 1000) 秒后锁"
-            return
-        }
+        // ── 蓝牙没信号：判据只有「断开够久」（1.50 删掉了定位判距）──
+        whyText = "蓝牙已断 · 离开满 \(store.cfg.awayMs / 1000) 秒后锁车"
         if !armed && !st.visited { whyText = "没靠近过这辆车，不会自动锁"; return }
         if doorKnown && (now - doorMs) < doorStaleMs && doorOpen {
             whyText = "有车门开着，暂停锁车"
@@ -5296,11 +5320,8 @@ final class AutoEngine: NSObject, ObservableObject {
     /// 1. **蓝牙一连上** → 立刻下发开锁（「连上即开」，见 `unlockOnConnect`）。
     /// 2. **蓝牙有可用信号**（连着、帧新鲜、RSSI ≥ 门限-6）→ 只按蓝牙判，
     ///    用**未平滑**读数 + 上升趋势；并且**把定位整个停掉**。省电主要来源。
-    /// 3. **蓝牙没信号** → 才拉起定位，而且定位只干一件事：粗档判距离，
-    ///    超过 100 米才锁车。1.28 起定位不再参与开锁。
+    /// 3. **蓝牙没信号** → 只按「断开够久」判离开。1.50 起定位完全不参与判定。
     private func decideAction(now: Int64, cfg: Logic.Cfg) -> Int {
-        let gcfg = store.geoCfg
-
         let rssiFresh = lastRssiAt > 0 && (now - lastRssiAt) < Logic.RSSI_FRESH_MS
         st.rssiFresh = rssiFresh
         // ── 1.28：判开锁用**未平滑**的原始读数 ──
@@ -5365,23 +5386,15 @@ final class AutoEngine: NSObject, ObservableObject {
             return bleAct == Logic.UNLOCK ? Logic.UNLOCK : Logic.NONE
         }
 
-        // ── 蓝牙不可用：定位只剩一件工作 —— 判「是否走远到该锁车」 ──
-        startGeoForFar()
-        let g = buildGeo(now, cfg, gcfg)
-        let ok = Geo.usable(g, gcfg)
-        if geoActive != ok { geoActive = ok }
-        updateDistText(g)
-        tuneGeoMode(g)
-
-        let farM = Logic.farLockM(store.geoFarM)
-        // 距上次判近过了多久。只给「定位用不了」的人兜底用：
-        // 没给定位授权的用户不能永远不锁车，那比误锁危险得多。
+        // ── 蓝牙不可用：离开判定只剩一条 —— 「断开够久」（1.50）──
+        //
+        // 原来这里会拉起 GPS、比 100 米才锁。删掉的原因见 `Store.geoOn`：
+        // 城区漂移把「在车边」算成「走远了」，车机停车后 183 秒才上报一次，
+        // 拿不到新鲜锁态就反复重发 —— 用户看到的就是「它一直在锁」。
+        // 现在不启动定位、不看距离，「蓝牙断开 + awayMs」就是全部判据。
         let awayLong = st.lastNearAt > 0 && (now - st.lastNearAt) > cfg.awayMs
 
-        geoSt = g
-
-        if Logic.farLockReady(bleUsable: false, geoUsable: ok, dist: g.dist,
-                              farM: farM, awayLong: awayLong) {
+        if awayLong {
             // 1.29：这条捷径不经过 decide，必须自己把闸门补齐。否则锁车成功后
             // 条件依旧成立，每一拍都会再下发一条锁车（本次到访已锁过 / 车已锁 /
             // 冷却期内，三种情况都不该再发）。
@@ -5423,42 +5436,11 @@ final class AutoEngine: NSObject, ObservableObject {
     /// 门限的简写，只给日志用
     private var cfgThr: Int { return store.cfg.thr }
 
-    /// 蓝牙没信号时才拉起定位，默认粗档。
-    /// 判 100 米用不着 10 米精度，粗档（百米精度 + 100 米位移）耗电约细档的十分之一。
-    private func startGeoForFar() {
-        guard running, store.geoOn else { return }
-        if loc.running { return }
-        guard loc.authorized else {
-            // 没授权就只记一次，别每次判定都弹提示
-            if !geoAskedThisSession {
-                geoAskedThisSession = true
-                loc.askPermission()
-                log("⚠︎ 蓝牙没信号、定位没授权 → 只能靠「断联 30 秒」判锁车")
-            }
-            locText = loc.statusText
-            return
-        }
-        loc.setBackground(store.locBg)
-        loc.setMode(.coarse)
-        loc.start()
-        locText = loc.statusText
-        log("▶ 蓝牙没信号 → 拉起粗档定位判距离（门槛 \(Int(Logic.farLockM(store.geoFarM))) 米）")
-    }
-
-    /// 定位档位自适应：远处粗档、回到车附近升细档。
-    /// 只有「人就在车边、要判 10 米」这一次才值得花细档的电。
-    private func tuneGeoMode(_ g: Geo.St) {
-        guard store.geoOn, loc.running else { return }
-        let farM = Logic.farLockM(store.geoFarM)
-        let target: Loc.Mode = (store.fenceOn
-            && Logic.canGoCoarse(dist: g.dist, acc: g.phoneAcc, fenceM: farM))
-            ? .coarse : .fine
-        loc.setMode(target)
-        // 车的位置已知就挂一个系统级围栏：App 被挂起也能在「回到车附近」时被叫醒
-        if g.carValid, !loc.fenceMatches(lat: g.carLat, lng: g.carLng) {
-            loc.startFence(lat: g.carLat, lng: g.carLng, radius: min(farM, fenceRadiusM))
-        }
-    }
+    // 1.50：`startGeoForFar()` 和 `tuneGeoMode(_:)` 已删除。
+    //
+    // 这两个函数是「蓝牙断开 → 拉起 GPS 粗档 → 比 100 米 → 判锁车」的全部实现。
+    // 走远锁车删掉后它们没有任何调用点，留着只会让人以为自动判定还在用定位。
+    // 自动模式现在一次 GPS 都不取；要看距离/位置走地图页，那边有独立的定位。
 
     private func updateDistText(_ g: Geo.St) {
         var t: String
@@ -5530,13 +5512,13 @@ final class AutoEngine: NSObject, ObservableObject {
     }
 
     /// 只给「用户手动要求」用的一处：切前后台模式时要让新参数立刻生效。
-    /// 自动判定路径已经改走 `startGeoForFar()`，不再调这个。
+    /// 自动判定路径**不再使用定位**（1.50 删掉了走远锁车），这里只服务地图/围栏。
     private func startLoc() {
         loc.setBackground(store.locBg)
         loc.askPermission()
         loc.start()
         locText = loc.statusText
-        log("▶ 定位已启动（\(loc.statusText)，门槛 \(Int(store.geoNearM)) / \(Int(Logic.farLockM(store.geoFarM))) 米）")
+        log("▶ 定位已启动（\(loc.statusText)）")
     }
 
     /// 界面切换「仅前台 / 前台+后台」
@@ -5554,25 +5536,8 @@ final class AutoEngine: NSObject, ObservableObject {
         if running { evaluate("定位模式切换") }
     }
 
-    /// 界面开关「走远锁车（用定位确认距离）」。
-    ///
-    /// 1.25 起语义变了：不再是「用定位判距为主」，而是
-    /// **「蓝牙没信号时，允许用定位确认 100 米再锁车」**。
-    /// 打开只是允许，真正启动要等蓝牙断开 —— 蓝牙连着时定位一直是停着的。
-    func setGeoEnabled(_ on: Bool) {
-        store.geoOn = on
-        geoEnabled = on
-        if on {
-            log("▶ 走远锁车：开（蓝牙没信号时才用定位确认 \(Int(Logic.farLockM(store.geoFarM))) 米）")
-            if running { evaluate("开启定位兜底") }
-        } else {
-            log("▶ 走远锁车：关（只按「蓝牙断联 30 秒」判锁车）")
-            loc.stop()
-            geoActive = false
-            distText = ""
-        }
-        locText = loc.statusText
-    }
+    // 1.50：`setGeoEnabled(_:)` 已删除。原来那个「走远锁车」开关唯一的作用
+    // 就是允许定位参与锁车判定，现在这条路径整条拿掉了（见 Store.geoOn）。
 
     // MARK: 一键启动 / 熄火
 
@@ -5735,7 +5700,7 @@ final class AutoEngine: NSObject, ObservableObject {
 
     private func handleLinkLost() {
         guard running else { return }
-        log("· 蓝牙断开 → 转定位判距（\(Int(Logic.farLockM(store.geoFarM))) 米外才锁）")
+        log("· 蓝牙断开 → 离开满 \(store.cfg.awayMs / 1000) 秒才锁（1.50 起不再看距离）")
         evaluate("蓝牙断开")
         queryAfterLinkLost()
     }
@@ -5793,7 +5758,7 @@ final class AutoEngine: NSObject, ObservableObject {
         if !running {
             text = ""
         } else if loc.running {
-            text = "定位判距 · 蓝牙没信号，\(Int(Logic.farLockM(store.geoFarM))) 米外自动锁"
+            text = "蓝牙优先 · 离开满 \(store.cfg.awayMs / 1000) 秒自动锁"
         } else {
             text = "蓝牙优先 · 已连车机，不取 GPS"
         }
@@ -6455,10 +6420,15 @@ final class AutoEngine: NSObject, ObservableObject {
                 // 实测这套节奏太急：地库里车机刚唤醒时第一条指令经常直接丢掉，
                 // 「试两次就放弃」的结果是人走到车边打不开门，还以为是蓝牙坏了。
                 // 现在改成每 20 秒一轮、最多 4 轮，一确认就停。
-                if netPendRounds < Logic.VERIFY_MAX_ROUNDS {
+                // 1.50：自动锁车只补 1 轮。人已经在走开，车机 183 秒才上报一次，
+                // 「20 秒没等到状态帧」是常态；按 4 轮补发就是 5 条指令 + 100 秒查询风暴。
+                let maxRounds = (!wasUnlock && netPendAuto)
+                    ? Logic.AUTO_LOCK_MAX_ROUNDS
+                    : Logic.VERIFY_MAX_ROUNDS
+                if netPendRounds < maxRounds {
                     netPendRounds += 1
                     netPendAt = now
-                    log("↻ 车机还没确认\(wasUnlock ? "开锁" : "锁车") → 第 \(netPendRounds)/\(Logic.VERIFY_MAX_ROUNDS) 轮重发")
+                    log("↻ 车机还没确认\(wasUnlock ? "开锁" : "锁车") → 第 \(netPendRounds)/\(maxRounds) 轮重发")
                     whyText = "重发\(wasUnlock ? "开锁" : "锁车")（第 \(netPendRounds) 轮）…"
                     if !dispatchFallback(unlock: wasUnlock) {
                         log("· 上一条指令还没结束，下一拍再重发")
@@ -6466,7 +6436,7 @@ final class AutoEngine: NSObject, ObservableObject {
                 } else {
                     netPendAt = 0
                     netUnconfirmed = true
-                    log("⚠ 已重发 \(Logic.VERIFY_MAX_ROUNDS) 轮，车机仍未确认\(wasUnlock ? "开锁" : "锁车")")
+                    log("⚠ 已重发 \(maxRounds) 轮，车机仍未确认\(wasUnlock ? "开锁" : "锁车")")
                     if !wasUnlock {
                         // 1.29：不再叠加「45 秒后再锁 3 次」。本次到访的锁车指令
                         // 已经发过 4 轮，车要么已经锁上（只是状态帧没回来），要么
@@ -7166,7 +7136,7 @@ final class AutoEngine: NSObject, ObservableObject {
         autoRefreshEnabled = on
         if on {
             startAutoRefresh()
-            log("· 自动刷新已开启（蓝牙断着时每 5 分钟查一次；开了走远锁车则为 55 秒）")
+            log("· 自动刷新已开启（蓝牙断着时每 5 分钟查一次）")
             autoRefreshTick()
         } else {
             stopAutoRefresh()
@@ -7194,10 +7164,11 @@ final class AutoEngine: NSObject, ObservableObject {
 
     /// 定时器 60 秒一拍，但真正发不发由这里的闸门决定。
     ///
-    /// 1.31 起频率分两档（用户主诉是省电，手动按钮兜底）：
-    /// - 没开「走远锁车」→ 5 分钟一条，够看个大概，剩下的交给手动刷新；
-    /// - 开了「走远锁车」→ 仍按 55 秒，因为 farLock 要靠**新鲜的车锁状态**
-    ///   才敢判「该不该锁」；锁态一旧，实际没锁却记着已锁，车就敞在那儿了。
+    /// 1.31 起频率分两档（用户主诉是省电，手动按钮兜底）。
+    /// **1.50 起只有一档：5 分钟。** 原来「开了走远锁车 → 55 秒」是因为
+    /// farLock 要靠新鲜锁态才敢判距离；现在判定只看「蓝牙断开够久」，
+    /// 不再依赖高频查询 —— 而且车机停车熄火后本来 183 秒才上报一次，
+    /// 55 秒一查有一次算一次都是白跑。要让状态更实时，开上面的「状态长连接」。
     ///
     /// 三条硬跳过缺一条，就会变成「偷偷联网、偷偷耗电」：
     /// 仅蓝牙模式、蓝牙正连着、正在执行指令。
@@ -7208,7 +7179,7 @@ final class AutoEngine: NSObject, ObservableObject {
         if ble.isConnected { return }
         if acting { return }
         let now = CarAPI.nowMs()
-        let gap: Int64 = store.geoOn ? 55_000 : 270_000
+        let gap: Int64 = 270_000
         if lastPollAt > 0 && now - lastPollAt < gap { return }
         lastPollAt = now
         log("· 自动刷新车辆状态")
@@ -7609,12 +7580,13 @@ extension AutoEngine: BleCentralDelegate {
             // 1.22 起不再要求「此刻判近」：手机落在车里、蓝牙刚断过，都会让判近失败，
             // 而「车从没锁变已锁」本身就说明刚才有人在车边动过它。
             //
-            // 1.26：记下翻转时刻。若人持续在车旁 20 秒（`Logic.decide` 里判），
+            // 1.26：记下翻转时刻。若人持续在车旁若干毫秒（`Logic.decide` 里判），
             // 就解除抑制 —— 否则下车拿个东西就再也拉不开门，这是最常见的罚站现场。
+            // 1.51：那段等待从 20 秒压到 3 秒（`Logic.UNLOCK_SUPPRESS_MS`）。
             st.unlockedThisVisit = true
             st.flipAt = CarAPI.nowMs()
             geoSt.unlockedThisVisit = true
-            log("车辆刚上锁（人还在车旁或手机落在车里）→ 20 秒内不自动开；持续在车旁会自动解除")
+            log("车辆刚上锁（人还在车旁或手机落在车里）→ \(Logic.UNLOCK_SUPPRESS_MS / 1000) 秒内不自动开，之后恢复")
         }
         // 锁车状态变了必须立刻让小组件知道；没变就走节流，别每 3 秒推一次
         pushWidget(force: !wasKnown || wasArmed != a)
@@ -8480,58 +8452,32 @@ struct MainView: View {
 
     // MARK: 定位
 
-    /// 定位设置。放两个开关：总开关（决定「按距离判」还是「按信号判」）、
-    /// 后台开关（决定锁屏后还算不算距离）。
+    /// 定位卡片（1.50）。
+    ///
+    /// 原来这里有「走远自动锁车」和「后台持续定位」两个开关 —— 都随 GPS 判距一起删了
+    /// （原因见 `Store.geoOn`）。现在定位在自动判定里彻底退场：这张卡只显示一次
+    /// 距车距离和定位状态，给「车停哪了、离我多远」这类一眼要看的信息。
+    /// 要看实时位置去地图页，那里有独立的定位，用完就停。
     private var locCard: some View {
         Card {
-            VStack(alignment: .leading, spacing: 14) {
-                HStack {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("走远自动锁车")
-                            .font(.system(size: 15, weight: .semibold))
-                            .foregroundColor(UI.text)
-                        Text("定位只用来判「该不该锁车」：蓝牙没信号、且距离超过 \(Int(Logic.farLockM(Store.shared.geoFarM))) 米才锁。1.28 起定位不再参与开锁 —— 开锁全交给蓝牙。")
-                            .font(.system(size: 11))
-                            .foregroundColor(UI.dim)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    Spacer()
-                    Toggle("", isOn: Binding(
-                        get: { e.geoEnabled },
-                        set: { e.setGeoEnabled($0) }
-                    ))
-                    .labelsHidden()
-                    .toggleStyle(SwitchToggleStyle(tint: UI.accent))
-                }
+            VStack(alignment: .leading, spacing: 10) {
+                SectionTitle(text: "定位")
 
-                Divider().background(UI.line)
-
-                HStack {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("后台持续定位")
-                            .font(.system(size: 15, weight: .semibold))
-                            .foregroundColor(UI.text)
-                        Text("锁屏后也能判距并自动开关锁。耗电明显增加，系统状态栏会出现定位箭头。")
-                            .font(.system(size: 11))
-                            .foregroundColor(UI.dim)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    Spacer()
-                    Toggle("", isOn: Binding(
-                        get: { e.locBackground },
-                        set: { e.setLocBackground($0) }
-                    ))
-                    .labelsHidden()
-                    .toggleStyle(SwitchToggleStyle(tint: UI.accent))
-                }
-
-                Text(e.distText.isEmpty ? "还没有定位数据" : e.distText)
+                Text(e.distText.isEmpty ? "还没有定位数据 · 地图页可看实时位置" : e.distText)
                     .font(.system(size: 12, design: .monospaced))
-                    .foregroundColor(e.geoActive ? UI.ok : UI.dim)
+                    .foregroundColor(UI.dim)
 
-                Text(e.locText)
+                Text("定位不再参与开关锁判定。离开只看「蓝牙断开 + 离开 \(Store.shared.awaySeconds) 秒」，"
+                    + "不取 GPS、不申请后台定位，也不会因为 GPS 漂移把你判成「走远了」。")
                     .font(.system(size: 11))
                     .foregroundColor(UI.dim)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if !e.locText.isEmpty {
+                    Text(e.locText)
+                        .font(.system(size: 11))
+                        .foregroundColor(UI.dim)
+                }
             }
         }
     }
@@ -8546,7 +8492,7 @@ struct MainView: View {
                         Text("自动靠近开锁 / 离开落锁")
                             .font(.system(size: 15, weight: .semibold))
                             .foregroundColor(UI.text)
-                        Text("蓝牙优先：连上车机就判开锁、不取 GPS；断开后离车 \(Int(Logic.farLockM(Store.shared.geoFarM))) 米以上才锁车")
+                        Text("蓝牙优先：连上车机就判开锁；断开后离开满 \(Store.shared.awaySeconds) 秒才锁车，不取 GPS")
                             .font(.system(size: 11))
                             .foregroundColor(UI.dim)
                             .fixedSize(horizontal: false, vertical: true)
@@ -8700,9 +8646,8 @@ struct MainView: View {
                               isOn: Binding(get: { e.raceEnabled }, set: { e.setRace($0) }))
                 }
 
-                toggleRow("离车较远时降低定位精度",
-                          "300 米外降到粗略定位，回到车附近自动升到 GPS 高频。精度只在需要时花钱。",
-                          isOn: Binding(get: { e.fenceEnabled }, set: { e.setFence($0) }))
+                // 1.50：「离车较远时降低定位精度」随走远锁车一起删了。
+                // 那个开关只在自动判距时有用；定位现在不参与判定，留着只是个不再生效的开关。
 
                 toggleRow("通知与震动",
                           "自动锁车发一条带距离的通知，开锁轻震一下；连续 3 次锁不上会发强提醒。",
@@ -8720,7 +8665,7 @@ struct MainView: View {
         switch m {
         case Logic.MODE_BLE:
             return "一条网络指令都不发：最省流量，也不受云端抖动影响。代价是蓝牙连不上时这一笔就放弃，"
-                + "走远锁车退回「断开够久」。"
+                + "离开判定完全靠「蓝牙断开够久」。"
         case Logic.MODE_NET:
             return "指令全走云端，人在车外也能用，但通常要 3~10 秒。蓝牙仍然连着 —— "
                 + "车锁和门位只能从车机状态帧读，断了就没有判定依据。"
@@ -8822,12 +8767,13 @@ struct MainView: View {
                           hint: "主要判据。连着车机、信号强于此值就算「在车旁」，直接开锁。这个值比定位准得多：贴车约 -55~-70，隔一堵墙就掉到 -85 以下。")
 
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("离开判定：蓝牙断联 + 定位 \(Int(Logic.farLockM(Store.shared.geoFarM))) 米外")
+                    Text("离开判定：蓝牙断开满 \(Store.shared.awaySeconds) 秒")
                         .font(.system(size: 14, weight: .medium))
                         .foregroundColor(UI.text)
-                    Text("两个条件同时成立才锁车。刚断开时人往往就在车边（下车、开后备箱、进便利店），"
-                        + "这时锁上等于把车锁在车主手里。只有真的走出这个距离才落锁。"
-                        + "没给定位授权的话，退回「断联 30 秒」兜底。")
+                    Text("「蓝牙断开」就是人走开的证据，不需要 GPS。断开后立刻连上（下车开后备箱、"
+                        + "在车边接个电话）会重新计时，所以不会刚下车就把车锁了。"
+                        + "1.50 删掉了原来的 GPS 100 米判据：城区漂移会误判，车机 183 秒才上报一次，"
+                        + "拿不到锁态还会反复重发。")
                         .font(.system(size: 11))
                         .foregroundColor(UI.dim)
                         .fixedSize(horizontal: false, vertical: true)
@@ -8838,7 +8784,7 @@ struct MainView: View {
                           value: $bleThr,
                           range: -95 ... -70,
                           step: 1,
-                          hint: "信号弱于此值就算「蓝牙已经没了」，转由定位判距离。低于 -90 基本等于穿墙后的残留链路，不能当成人在车边。")
+                          hint: "信号弱于此值就算「蓝牙已经没了」，开始计时「离开多久」。低于 -90 基本等于穿墙后的残留链路，不能当成人在车边。")
 
                 Button {
                     e.refreshStatus()
@@ -9083,6 +9029,11 @@ struct CarMapView: UIViewRepresentable {
 //  说明它也是这么处理的。
 //
 
+import SwiftUI
+import UIKit
+import MapKit
+import CoreLocation
+import UserNotifications
 
 // MARK: - 轨迹仓库
 
@@ -10618,6 +10569,8 @@ struct MapPage: View {
 //  识别器接走，表现就是「点了没反应」。放进面板里就不抢触摸了。
 //
 
+import SwiftUI
+import MapKit
 
 // MARK: - 公共零件
 
