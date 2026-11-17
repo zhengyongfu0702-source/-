@@ -879,7 +879,15 @@ enum Logic {
         /// 原来一律要「走开 30 秒再回来」，于是下车关门、车一自锁，人就再也
         /// 拉不开门了 —— 用户说的罚站，很多是这一条。自锁回环只发生在几秒内，
         /// 用几秒的持续在旁作确认，既挡住回环又不会把人关在门外（1.51 起 3 秒）。
+        ///
+        /// 1.52 起还要配合 `flipRssi` 判方向 —— 只看时间分不清「停下来拿东西」
+        /// 和「锁好车走人」，两者在自锁那一刻都站在车边。
         var flipAt: Int64 = 0
+        /// 自锁那一刻的信号读数（dBm）。-127 表示当时没有新鲜读数。
+        ///
+        /// 用途只有一个：放行时比对，确认人**没有在走远**。
+        /// 绕车拿东西掉 8~12dB，走向电梯掉 10dB 以上，站在门边基本不动。
+        var flipRssi = -127
         /// 连续多少拍判定为「已离开」，用于抗丢包
         var awayTicks = 0
     }
@@ -894,7 +902,7 @@ enum Logic {
         ///
         /// 冷却本来是为了挡住「门在 10 米线上抖 → 开了又锁、锁了又开」。
         /// 但真正挡住这个的是 `unlockedThisVisit`：一次到访只开一次，要等走开
-        /// 30 秒或车自锁后 3 秒才重置。冷却叠在上面只剩一个副作用 ——
+        /// 30 秒或车自锁后 2 秒（且没在走远）才重置。冷却叠在上面只剩一个副作用 ——
         /// 刚锁完车转身要拿东西，60 秒内怎么都不给开。所以取消。
         var unlockCooldownMs: Int64 = 0
         var lockCooldownMs: Int64 = 60000
@@ -956,11 +964,24 @@ enum Logic {
         // 现场：下车关门，车辆自动上锁（未锁→已锁），人转身想在副驾拿包。
         // 1.25 及以前这里要把「走开 30 秒」当解除条件，于是门怎么拉都不开。
         // 1.26 改成「在车旁持续 20 秒」，挡住回环但还是要干站 20 秒。
-        // 1.51 压到 3 秒：自锁回环 1~3 秒内就暴露，3 秒足够挡；而人要拿包，
-        // 3 秒后拉门就该开。常数见 `UNLOCK_SUPPRESS_MS`。
+        // 1.51 压到 3 秒；1.52 又加了一道方向门控 —— 只看时间的话，锁好车
+        // 正往电梯走的你也会被判成「要上车」，车就在身后自己弹开。
+        //
+        // 方向门控：自锁那一刻记下 `flipRssi`，放行时要求当前读数没有掉超过
+        // `FLIP_RSSI_SLACK_DB`。走人 → 掉 8dB 以上 → 不解除，等 30 秒后正常锁车。
+        // 没有新鲜读数时宁可不解（下一条：等下次靠近），也不要在你走的时候开。
         if s.armed && s.unlockedThisVisit && near && s.flipAt > 0
             && (s.now - s.flipAt) > UNLOCK_SUPPRESS_MS {
-            s.unlockedThisVisit = false
+            // 自锁时没读到信号 → 退化成「现在确实是贴着车」才放行
+            let notWalkingAway: Bool
+            if s.flipRssi > -120 {
+                notWalkingAway = s.rssiFresh && s.rssi >= s.flipRssi - FLIP_RSSI_SLACK_DB
+            } else {
+                notWalkingAway = s.rssiFresh && s.rssi >= c.thr
+            }
+            if notWalkingAway {
+                s.unlockedThisVisit = false
+            }
         }
 
         if s.busy || !s.armedKnown {
@@ -1188,12 +1209,29 @@ enum Logic {
 
     /// 车自己上锁之后，人还站在车旁要等多久才允许再开锁（毫秒）。
     ///
-    /// 1.51：20 秒 → 3 秒。
+    /// 1.51：20 秒 → 3 秒。1.52：3 秒 → 2 秒，并加「方向门控」。
     ///
     /// 这个等待只为挡住「自锁 → 又开 → 又锁」的回弹，而回弹只在 1~3 秒内发生；
     /// 20 秒挡住回弹的同时也把人挡在门外 —— 下车关门、车自锁、你转身想拿副驾的包，
     /// 拉门不动，得干站 20 秒。现场反馈里「罚站」很大一部分就是这 20 秒。
-    static let UNLOCK_SUPPRESS_MS: Int64 = 3000
+    ///
+    /// 只压缩时间会闯另一个祸：状态帧 3 秒一帧，3 秒后放行时你可能已经锁好车
+    /// 在往电梯走，车会在身后自己弹开。所以放行必须同时满足「信号没明显走弱」
+    /// （见 `St.flipRssi`）—— 停下拿东西的人信号持平或小幅波动，走人的人
+    /// 3 秒内至少退 3 米、掉 10dB 上下。
+    ///
+    /// 取 2 秒而不是 3 秒：判定只在状态帧到达时跑（3 秒一帧），阈值留一格容差，
+    /// 保证自锁后的**下一帧**就能放行，实际生效仍在 3 秒上下。
+    static let UNLOCK_SUPPRESS_MS: Int64 = 2000
+
+    /// 判定「没有走远」的信号容差（dB）。
+    ///
+    /// 取 8 的依据：自锁那一刻人贴车门，约 -50dBm；
+    /// - 在车周围绕到副驾/后备箱（3~4 米）→ 掉到 -58~-62，差 8~12dB
+    /// - 直接走向电梯（3 秒至少 3 米）→ 掉 10dB 以上
+    /// 8dB 能放过「绕车拿东西」，又拦得住「抬脚走人」。
+    /// 取 5 会误伤绕车的人，取 12 就拦不住慢走的人。
+    static let FLIP_RSSI_SLACK_DB = 8
 
     /// 蓝牙信号是否「实质可用」：连着、有读数、且明显强于开锁门限。
     ///
@@ -4541,7 +4579,7 @@ final class AutoEngine: NSObject, ObservableObject {
     /// 参与了编译，界面上才会跟着变。
     ///
     /// 每次改源码就换一个值，装完瞄一眼底部就知道装的是哪一次构建。
-    static let buildTag = "b1116a"
+    static let buildTag = "b1117a"
 
     let ble = BleCentral()
     let api = CarAPI()
@@ -4715,6 +4753,10 @@ final class AutoEngine: NSObject, ObservableObject {
     /// 这条指令在「网络 ↔ 蓝牙」之间已经互转了几次。最多一次，
     /// 否则两条都失败时会在两个回调里来回弹，把同一条指令发个没完。
     private var fallbackRound = 0
+    /// 手动按钮上一次点击的时刻与方向（1.52）。
+    /// 大按钮没有禁用态时，用户连点会真的发出多条；同方向 3 秒内只认第一条。
+    private var manualSameAt: Int64 = 0
+    private var manualSameUnlock = false
 
     private var pendingUnlock = false
     private var pendingChannel = 0
@@ -4997,6 +5039,7 @@ final class AutoEngine: NSObject, ObservableObject {
         st.visited = false
         st.unlockedThisVisit = false
         st.flipAt = 0
+        st.flipRssi = -127
         st.awayTicks = 0
         st.lastNearAt = 0
         geoSt = Geo.St()
@@ -5116,7 +5159,12 @@ final class AutoEngine: NSObject, ObservableObject {
 
         // 等开锁的窗口里把采样提到 2 秒。开完锁（或车本来就是开的）立刻回 5 秒 ——
         // 不能在车边整天 2 秒一次地读，那点电全花在这上面了。
-        ble.setFastRssi(running && ble.isConnected && armed && !st.unlockedThisVisit)
+        //
+        // 1.52：车刚自锁的 10 秒是例外 —— 方向门控要拿这几秒的信号走向判断
+        // 「站着」还是「走人」，采样掉到 5 秒就看不清了。10 秒后照常收敛。
+        let observingFlip = st.flipAt > 0 && (now - st.flipAt) < 10_000
+        ble.setFastRssi(running && ble.isConnected && armed
+                        && (!st.unlockedThisVisit || observingFlip))
 
         // 判定全在 decideAction 里（1.25）：蓝牙优先，接不上才转定位。
         let act = wash ? Logic.NONE : decideAction(now: now, cfg: cfg)
@@ -5208,7 +5256,7 @@ final class AutoEngine: NSObject, ObservableObject {
             if st.unlockedThisVisit && armed {
                 // flipAt > 0 是「车辆自己锁上的」；否则是你在车边用手机锁的
                 if st.flipAt > 0 {
-                    whyText = "车辆刚自己上锁 · 3 秒后拉门就会自动开"
+                    whyText = "车辆刚自己上锁 · 站在车边约 3 秒后会自动开（走开就不动）"
                 } else {
                     whyText = "本次到访刚锁过车 · 走开再回来才会自动开"
                 }
@@ -5768,7 +5816,21 @@ final class AutoEngine: NSObject, ObservableObject {
     // MARK: 动作
 
     /// 手动按钮：定位可用时网络为主，否则蓝牙优先；失败自动转另一条
+    ///
+    /// 1.52：同方向 3 秒内只认第一条。手动下发本身没有业务冷却（自动判定那套
+    /// `unlockCooldownMs` / `lockCooldownMs` 只管自动），以前连点三下就会真发三条，
+    /// 最后一条可能落在你已经走开之后 —— 观感上就是「它怎么又发了一条」。
+    /// 反方向不拦：开→锁 本来就是常见操作序列。
     func manual(unlock: Bool) {
+        let now = CarAPI.nowMs()
+        if manualSameAt > 0, manualSameUnlock == unlock, now - manualSameAt < 3000 {
+            let wait = (3000 - (now - manualSameAt) + 999) / 1000
+            lastResult = "刚发过\(unlock ? "开锁" : "锁车")，\(wait) 秒后可再点"
+            log("· 手动\(unlock ? "开锁" : "锁车")：3 秒内同向重复点击 → 忽略（还差 \(wait)s）")
+            return
+        }
+        manualSameAt = now
+        manualSameUnlock = unlock
         log("▶ 手动\(unlock ? "开锁" : "锁车")")
         requestAction(unlock: unlock, manual: true)
     }
@@ -6032,6 +6094,11 @@ final class AutoEngine: NSObject, ObservableObject {
             lastLockAt = now
             st.visited = false
             st.unlockedThisVisit = true
+            // 1.52：手动/主动锁车不是「车自己锁上」，清掉自锁时间戳。
+            // 不清的话，`Logic.decide` 的定时解除规则会把 flipAt 当成刚刚自锁，
+            // 几秒后就把你刚锁上的车重新打开（1.51 之前是 20 秒后才犯）。
+            st.flipAt = 0
+            st.flipRssi = -127
             lockedForThisVisit = true
             autoLockFails = 0
             autoLockRetryAt = 0
@@ -6285,6 +6352,10 @@ final class AutoEngine: NSObject, ObservableObject {
             // 否则人只要在车边站够 60 秒冷却，车就会自己又解开一次。
             // 真正走开（awayLong）之后 Logic 会把它重置，下次走近照常开锁。
             st.unlockedThisVisit = true
+            // 1.52：同上，主动锁车要清掉「自锁时间戳」，否则定时解除规则
+            // 会把这次锁车当成车自己刚锁的，下一帧就把车打开。
+            st.flipAt = 0
+            st.flipRssi = -127
             lockedForThisVisit = true
             if channel == Logic.CH_BLE {
                 // 回执 ≠ 车真的锁了（实测状态帧 2.6 秒后才翻），留个待核实标记
@@ -6450,7 +6521,12 @@ final class AutoEngine: NSObject, ObservableObject {
                         }
                         whyText = "⚠ 锁车没能确认，请手动核对车锁"
                     } else {
-                        whyText = "⚠ 开锁没能确认，车可能还锁着"
+                        // 1.52：开锁一直没确认，必须把「本次到访已开过」还回去。
+                        // 之前这里只写一句话就结束，标记还留着 —— 车锁着、人站在
+                        // 车边、判定却认为「开过了」，只能走开 30 秒才解除。
+                        // 这是罚站里最钝的一条：跟信号无关，纯粹是漏了归还。
+                        clearVisitOnUnlockFail()
+                        whyText = "⚠ 开锁没能确认 · 车可能还锁着，已放开重试（拉门或再点一次）"
                     }
                 }
             }
@@ -7583,10 +7659,16 @@ extension AutoEngine: BleCentralDelegate {
             // 1.26：记下翻转时刻。若人持续在车旁若干毫秒（`Logic.decide` 里判），
             // 就解除抑制 —— 否则下车拿个东西就再也拉不开门，这是最常见的罚站现场。
             // 1.51：那段等待从 20 秒压到 3 秒（`Logic.UNLOCK_SUPPRESS_MS`）。
+            // 1.52：再记一份当时的信号强度，放行时比对方向 —— 正在走远的人
+            // 信号会掉，不能被当成「要上车」。没新鲜读数就记 -127（无效）。
+            let nowMs = CarAPI.nowMs()
+            let freshRssi = lastRssiAt > 0 && (nowMs - lastRssiAt) < Logic.RSSI_FRESH_MS
+            st.flipRssi = (freshRssi && lastRssiValue > -120) ? lastRssiValue : -127
             st.unlockedThisVisit = true
-            st.flipAt = CarAPI.nowMs()
+            st.flipAt = nowMs
             geoSt.unlockedThisVisit = true
-            log("车辆刚上锁（人还在车旁或手机落在车里）→ \(Logic.UNLOCK_SUPPRESS_MS / 1000) 秒内不自动开，之后恢复")
+            let base = st.flipRssi > -120 ? "\(st.flipRssi)dBm" : "无读数"
+            log("车辆刚上锁（人还在车旁或手机落在车里）→ \(Logic.UNLOCK_SUPPRESS_MS / 1000) 秒后开始判断，信号没走弱才开（基准 \(base)）")
         }
         // 锁车状态变了必须立刻让小组件知道；没变就走节流，别每 3 秒推一次
         pushWidget(force: !wasKnown || wasArmed != a)
@@ -8395,10 +8477,19 @@ struct MainView: View {
     private var actionCard: some View {
         VStack(spacing: 10) {
             HStack(spacing: 10) {
-                BigButton(title: "开锁", subtitle: Logic.modeName(e.chMode), color: UI.accent) {
+                // 1.52：执行中给出状态并禁用，跟「启动中…/熄火中…」一致。
+                // 以前这两个按钮没有禁用态，连点会被 acting 静默丢掉一条，
+                // 用户看到的是「点了没反应」。
+                BigButton(title: e.acting ? "开锁中…" : "开锁",
+                          subtitle: Logic.modeName(e.chMode),
+                          color: UI.accent,
+                          enabled: !e.acting) {
                     e.manual(unlock: true)
                 }
-                BigButton(title: "锁车", subtitle: Logic.modeName(e.chMode), color: UI.warn) {
+                BigButton(title: e.acting ? "锁车中…" : "锁车",
+                          subtitle: Logic.modeName(e.chMode),
+                          color: UI.warn,
+                          enabled: !e.acting) {
                     e.manual(unlock: false)
                 }
             }
